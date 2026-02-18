@@ -54,20 +54,24 @@ impl Scene {
             x.push(rng.random_range(-scale..=scale));
             y.push(rng.random_range(-scale..=scale));
             z.push(rng.random_range(-scale..=scale));
-            opacity.push(0.1);
+            opacity.push(0.2);
             r.push(rng.random_range(0.0..=1.0));
             g.push(rng.random_range(0.0..=1.0));
             b.push(rng.random_range(0.0..=1.0));
         }
 
+        let learning_rate = 1e-3;
+        let beta1 = 0.9;
+        let beta2 = 0.999;
+
         Ok(Self {
-            centroid_x: Parameter::new(x, 1e-3, 0.9, 0.999),
-            centroid_y: Parameter::new(y, 1e-3, 0.9, 0.999),
-            centroid_z: Parameter::new(z, 1e-3, 0.9, 0.999),
-            centroid_opacity: Parameter::new(opacity, 1e-3, 0.9, 0.999),
-            centroid_r: Parameter::new(r, 1e-3, 0.9, 0.999),
-            centroid_g: Parameter::new(g, 1e-3, 0.9, 0.999),
-            centroid_b: Parameter::new(b, 1e-3, 0.9, 0.999),
+            centroid_x: Parameter::new(x, learning_rate, beta1, beta2),
+            centroid_y: Parameter::new(y, learning_rate, beta1, beta2),
+            centroid_z: Parameter::new(z, learning_rate, beta1, beta2),
+            centroid_opacity: Parameter::new(opacity, learning_rate, beta1, beta2),
+            centroid_r: Parameter::new(r, learning_rate, beta1, beta2),
+            centroid_g: Parameter::new(g, learning_rate, beta1, beta2),
+            centroid_b: Parameter::new(b, learning_rate, beta1, beta2),
             centroid_neighbors: vec![Vec::new(); count],
         })
     }
@@ -168,13 +172,12 @@ impl Scene {
         direction: [f32; 3],
     ) -> Result<[f32; 3], SceneError> {
         self.validate_lengths()?;
-        let count = self.centroid_x.len();
-        if count == 0 {
+        if self.centroid_x.is_empty() {
             return Err(SceneError::EmptyScene);
         }
-        if self.centroid_neighbors.len() != count {
+        if self.centroid_neighbors.len() != self.centroid_x.len() {
             return Err(SceneError::InconsistentNeighborData {
-                expected: count,
+                expected: self.centroid_x.len(),
                 got: self.centroid_neighbors.len(),
             });
         }
@@ -188,14 +191,8 @@ impl Scene {
         let mut remaining = 1.0_f32;
         let mut current = self.closest_centroid_at_point(start_position);
         let mut origin = start_position;
-        let mut visited = vec![false; count];
 
-        for _ in 0..count {
-            if visited[current] {
-                break;
-            }
-            visited[current] = true;
-
+        loop {
             let next = self.next_centroid_along_ray(current, origin, direction);
             let is_terminal = next.is_none();
             let centroid_color = self.centroid_color(current);

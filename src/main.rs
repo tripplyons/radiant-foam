@@ -7,7 +7,7 @@ use crate::scene::Scene;
 use image::RgbImage;
 
 fn main() {
-    let mut scene = Scene::new_random(1000, 10.0).expect("scale must be non-negative");
+    let mut scene = Scene::new_random(100, 5.0).expect("scale must be non-negative");
     scene
         .compute_neighbors()
         .expect("failed to compute centroid neighbors");
