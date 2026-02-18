@@ -5,18 +5,18 @@ pub enum ParameterError {
 
 #[derive(Debug)]
 pub struct Parameter {
-    pub values: Vec<f32>,
-    pub m: Vec<f32>,
-    pub v: Vec<f32>,
-    pub learning_rate: f32,
-    pub beta1: f32,
-    pub beta2: f32,
-    pub epsilon: f32,
+    pub values: Vec<f64>,
+    pub m: Vec<f64>,
+    pub v: Vec<f64>,
+    pub learning_rate: f64,
+    pub beta1: f64,
+    pub beta2: f64,
+    pub epsilon: f64,
     pub step: u64,
 }
 
 impl Parameter {
-    pub fn new(values: Vec<f32>, learning_rate: f32, beta1: f32, beta2: f32) -> Self {
+    pub fn new(values: Vec<f64>, learning_rate: f64, beta1: f64, beta2: f64) -> Self {
         let len = values.len();
         Self {
             values,
@@ -38,7 +38,7 @@ impl Parameter {
         self.values.is_empty()
     }
 
-    pub fn update_adam(&mut self, gradients: &[f32]) -> Result<(), ParameterError> {
+    pub fn update_adam(&mut self, gradients: &[f64]) -> Result<(), ParameterError> {
         if gradients.len() != self.values.len() {
             return Err(ParameterError::GradientLengthMismatch {
                 expected: self.values.len(),
@@ -47,7 +47,7 @@ impl Parameter {
         }
 
         self.step = self.step.saturating_add(1);
-        let t = self.step as f32;
+        let t = self.step as f64;
         let bias_correction1 = 1.0 - self.beta1.powf(t);
         let bias_correction2 = 1.0 - self.beta2.powf(t);
 

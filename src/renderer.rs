@@ -27,12 +27,12 @@ pub trait Renderer {
 pub struct OrthographicRenderer {
     pub width: u32,
     pub height: u32,
-    pub world_x_min: f32,
-    pub world_x_max: f32,
-    pub world_y_min: f32,
-    pub world_y_max: f32,
-    pub ray_start_z: f32,
-    pub ray_direction: [f32; 3],
+    pub world_x_min: f64,
+    pub world_x_max: f64,
+    pub world_y_min: f64,
+    pub world_y_max: f64,
+    pub ray_start_z: f64,
+    pub ray_direction: [f64; 3],
 }
 
 impl OrthographicRenderer {
@@ -49,14 +49,14 @@ impl OrthographicRenderer {
         }
     }
 
-    fn pixel_to_world(&self, px: u32, py: u32) -> [f32; 3] {
+    fn pixel_to_world(&self, px: u32, py: u32) -> [f64; 3] {
         let nx = if self.width > 1 {
-            px as f32 / (self.width - 1) as f32
+            px as f64 / (self.width - 1) as f64
         } else {
             0.5
         };
         let ny = if self.height > 1 {
-            py as f32 / (self.height - 1) as f32
+            py as f64 / (self.height - 1) as f64
         } else {
             0.5
         };
@@ -73,10 +73,8 @@ impl Renderer for OrthographicRenderer {
         let mut pixels = vec![0_u8; (self.width as usize) * (self.height as usize) * 3];
         let row_stride = (self.width as usize) * 3;
 
-        pixels
-            .par_chunks_mut(row_stride)
-            .enumerate()
-            .try_for_each(|(py, row)| -> Result<(), RendererError> {
+        pixels.par_chunks_mut(row_stride).enumerate().try_for_each(
+            |(py, row)| -> Result<(), RendererError> {
                 let py = py as u32;
                 for px in 0..self.width {
                     let start = self.pixel_to_world(px, py);
@@ -88,7 +86,8 @@ impl Renderer for OrthographicRenderer {
                     row[idx + 2] = (color[2].clamp(0.0, 1.0) * 255.0).round() as u8;
                 }
                 Ok(())
-            })?;
+            },
+        )?;
 
         Ok(ImageData {
             width: self.width,
