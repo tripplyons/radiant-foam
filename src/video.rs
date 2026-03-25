@@ -8,6 +8,7 @@ use std::process::Command;
 
 const DEFAULT_FPS: f64 = 2.0;
 const DEFAULT_LOG_DENSITY: f64 = -3.0;
+const DEFAULT_DISTORTION_LAMBDA: f64 = 1e-2;
 const DEFAULT_LEARNING_RATE: f64 = 1e-3;
 const DEFAULT_BETA1: f64 = 0.9;
 const DEFAULT_BETA2: f64 = 0.999;
@@ -18,6 +19,7 @@ pub struct VideoInitOptions {
     pub max_points: Option<usize>,
     pub initial_log_density: f64,
     pub train_epochs: usize,
+    pub distortion_lambda: f64,
 }
 
 impl Default for VideoInitOptions {
@@ -27,6 +29,7 @@ impl Default for VideoInitOptions {
             max_points: Some(10_000),
             initial_log_density: DEFAULT_LOG_DENSITY,
             train_epochs: 1,
+            distortion_lambda: DEFAULT_DISTORTION_LAMBDA,
         }
     }
 }
@@ -259,7 +262,10 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
     ) -> Result<(), VideoInitError> {
         for _ in 0..self.options.train_epochs {
             for frame in frames {
-                let renderer = PerspectiveRenderer::new(frame.camera.clone());
+                let renderer = PerspectiveRenderer::with_distortion(
+                    frame.camera.clone(),
+                    self.options.distortion_lambda,
+                );
                 renderer.train_step(scene, &frame.target)?;
             }
         }
