@@ -86,6 +86,28 @@ pub trait Renderer {
     ) -> Result<TrainStepResult, RendererError>;
 }
 
+#[derive(Clone, Debug)]
+pub struct PerspectiveCamera {
+    pub width: u32,
+    pub height: u32,
+    pub focal_x: f64,
+    pub focal_y: f64,
+    pub principal_x: f64,
+    pub principal_y: f64,
+    pub origin: [f64; 3],
+    pub camera_to_world: [[f64; 3]; 3],
+}
+
+impl PerspectiveCamera {
+    pub fn pixel_to_world_ray(&self, px: u32, py: u32) -> ([f64; 3], [f64; 3]) {
+        let x = (px as f64 + 0.5 - self.principal_x) / self.focal_x;
+        let y = (py as f64 + 0.5 - self.principal_y) / self.focal_y;
+        let direction_camera = normalize([x, y, 1.0]);
+        let direction_world = normalize(mat3_mul_vec3(self.camera_to_world, direction_camera));
+        (self.origin, direction_world)
+    }
+}
+
 #[derive(Debug)]
 pub struct OrthographicRenderer {
     pub width: u32,
@@ -131,16 +153,7 @@ impl OrthographicRenderer {
     }
 
     fn validate_target(&self, target: &ImageData) -> Result<(), RendererError> {
-        if target.width == self.width && target.height == self.height {
-            Ok(())
-        } else {
-            Err(RendererError::TargetSizeMismatch {
-                expected_width: self.width,
-                expected_height: self.height,
-                got_width: target.width,
-                got_height: target.height,
-            })
-        }
+        validate_target_dimensions(self.width, self.height, target)
     }
 
     fn render_linear(&self, scene: &Scene) -> Result<Vec<f64>, RendererError> {
@@ -226,6 +239,90 @@ impl OrthographicRenderer {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PerspectiveRenderer {
+    pub camera: PerspectiveCamera,
+}
+
+impl PerspectiveRenderer {
+    pub fn new(camera: PerspectiveCamera) -> Self {
+        Self { camera }
+    }
+
+    fn validate_target(&self, target: &ImageData) -> Result<(), RendererError> {
+        validate_target_dimensions(self.camera.width, self.camera.height, target)
+    }
+
+    fn render_linear(&self, scene: &Scene) -> Result<Vec<f64>, RendererError> {
+        let mut pixels =
+            vec![0.0_f64; (self.camera.width as usize) * (self.camera.height as usize) * 3];
+        let row_stride = (self.camera.width as usize) * 3;
+
+        pixels.par_chunks_mut(row_stride).enumerate().try_for_each(
+            |(py, row)| -> Result<(), RendererError> {
+                let py = py as u32;
+                for px in 0..self.camera.width {
+                    let (start, direction) = self.camera.pixel_to_world_ray(px, py);
+                    let color = trace_ray(scene, start, direction)?.0;
+
+                    let idx = (px as usize) * 3;
+                    row[idx] = color[0];
+                    row[idx + 1] = color[1];
+                    row[idx + 2] = color[2];
+                }
+                Ok(())
+            },
+        )?;
+
+        Ok(pixels)
+    }
+
+    fn mse_loss(&self, scene: &Scene, target: &ImageData) -> Result<f64, RendererError> {
+        self.validate_target(target)?;
+        compute_mse_loss(&self.render_linear(scene)?, target)
+    }
+
+    pub fn compute_gradients(
+        &self,
+        scene: &Scene,
+        target: &ImageData,
+    ) -> Result<SceneGradients, RendererError> {
+        self.validate_target(target)?;
+        let count = validate_scene(scene)?;
+
+        let mut gradients = SceneGradients::zeros(count);
+        let normalizer =
+            2.0 / ((self.camera.width as usize * self.camera.height as usize * 3) as f64);
+        let target_scale = 1.0 / 255.0;
+
+        for py in 0..self.camera.height {
+            for px in 0..self.camera.width {
+                let (start, direction) = self.camera.pixel_to_world_ray(px, py);
+                let (pixel_color, segments) = trace_ray(scene, start, direction)?;
+                let pixel_index = ((py * self.camera.width + px) as usize) * 3;
+                let output_grad = [
+                    normalizer * (pixel_color[0] - target.pixels[pixel_index] as f64 * target_scale),
+                    normalizer
+                        * (pixel_color[1] - target.pixels[pixel_index + 1] as f64 * target_scale),
+                    normalizer
+                        * (pixel_color[2] - target.pixels[pixel_index + 2] as f64 * target_scale),
+                ];
+
+                accumulate_trace_gradients(
+                    scene,
+                    &segments,
+                    start,
+                    direction,
+                    output_grad,
+                    &mut gradients,
+                );
+            }
+        }
+
+        Ok(gradients)
+    }
+}
+
 impl Renderer for OrthographicRenderer {
     fn render(&self, scene: &Scene) -> Result<ImageData, RendererError> {
         let rendered = self.render_linear(scene)?;
@@ -265,6 +362,78 @@ impl Renderer for OrthographicRenderer {
 
         Ok(TrainStepResult { loss, gradients })
     }
+}
+
+impl Renderer for PerspectiveRenderer {
+    fn render(&self, scene: &Scene) -> Result<ImageData, RendererError> {
+        let rendered = self.render_linear(scene)?;
+        let pixels = rendered
+            .chunks_exact(3)
+            .flat_map(|rgb| {
+                rgb.iter()
+                    .map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
+            })
+            .collect();
+
+        Ok(ImageData {
+            width: self.camera.width,
+            height: self.camera.height,
+            pixels,
+        })
+    }
+
+    fn train_step(
+        &self,
+        scene: &mut Scene,
+        target: &ImageData,
+    ) -> Result<TrainStepResult, RendererError> {
+        let loss = self.mse_loss(scene, target)?;
+        let gradients = self.compute_gradients(scene, target)?;
+
+        scene.centroid_x.update_adam(&gradients.centroid_x)?;
+        scene.centroid_y.update_adam(&gradients.centroid_y)?;
+        scene.centroid_z.update_adam(&gradients.centroid_z)?;
+        scene
+            .centroid_opacity
+            .update_adam(&gradients.centroid_opacity)?;
+        scene.centroid_r.update_adam(&gradients.centroid_r)?;
+        scene.centroid_g.update_adam(&gradients.centroid_g)?;
+        scene.centroid_b.update_adam(&gradients.centroid_b)?;
+        scene.compute_neighbors()?;
+
+        Ok(TrainStepResult { loss, gradients })
+    }
+}
+
+fn validate_target_dimensions(
+    expected_width: u32,
+    expected_height: u32,
+    target: &ImageData,
+) -> Result<(), RendererError> {
+    if target.width == expected_width && target.height == expected_height {
+        Ok(())
+    } else {
+        Err(RendererError::TargetSizeMismatch {
+            expected_width,
+            expected_height,
+            got_width: target.width,
+            got_height: target.height,
+        })
+    }
+}
+
+fn compute_mse_loss(rendered: &[f64], target: &ImageData) -> Result<f64, RendererError> {
+    let target_scale = 1.0 / 255.0;
+    let mse = rendered
+        .iter()
+        .zip(&target.pixels)
+        .map(|(&predicted, &target)| {
+            let diff = predicted - (target as f64 * target_scale);
+            diff * diff
+        })
+        .sum::<f64>()
+        / rendered.len() as f64;
+    Ok(mse)
 }
 
 fn validate_scene(scene: &Scene) -> Result<usize, SceneError> {
@@ -559,6 +728,14 @@ fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+fn mat3_mul_vec3(matrix: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
+    [
+        matrix[0][0] * vector[0] + matrix[0][1] * vector[1] + matrix[0][2] * vector[2],
+        matrix[1][0] * vector[0] + matrix[1][1] * vector[1] + matrix[1][2] * vector[2],
+        matrix[2][0] * vector[0] + matrix[2][1] * vector[1] + matrix[2][2] * vector[2],
+    ]
+}
+
 fn dist_sq(a: [f64; 3], b: [f64; 3]) -> f64 {
     let dx = a[0] - b[0];
     let dy = a[1] - b[1];
@@ -581,7 +758,10 @@ fn clamp_derivative(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImageData, OrthographicRenderer, Renderer, RendererError};
+    use super::{
+        ImageData, OrthographicRenderer, PerspectiveCamera, PerspectiveRenderer, Renderer,
+        RendererError,
+    };
     use crate::parameter::Parameter;
     use crate::scene::Scene;
 
@@ -604,6 +784,36 @@ mod tests {
         assert_eq!(image.width, 16);
         assert_eq!(image.height, 8);
         assert_eq!(image.pixels.len(), 16 * 8 * 3);
+    }
+
+    #[test]
+    fn perspective_renderer_outputs_expected_shape() {
+        let scene = Scene {
+            centroid_x: Parameter::new(vec![0.0], 1e-3, 0.9, 0.999),
+            centroid_y: Parameter::new(vec![0.0], 1e-3, 0.9, 0.999),
+            centroid_z: Parameter::new(vec![3.0], 1e-3, 0.9, 0.999),
+            centroid_opacity: Parameter::new(vec![1.0], 1e-3, 0.9, 0.999),
+            centroid_r: Parameter::new(vec![0.2], 1e-3, 0.9, 0.999),
+            centroid_g: Parameter::new(vec![0.4], 1e-3, 0.9, 0.999),
+            centroid_b: Parameter::new(vec![0.8], 1e-3, 0.9, 0.999),
+            centroid_neighbors: vec![vec![]],
+        };
+        let renderer = PerspectiveRenderer::new(PerspectiveCamera {
+            width: 4,
+            height: 3,
+            focal_x: 3.0,
+            focal_y: 3.0,
+            principal_x: 2.0,
+            principal_y: 1.5,
+            origin: [0.0, 0.0, 0.0],
+            camera_to_world: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        });
+
+        let image = renderer.render(&scene).expect("render should succeed");
+
+        assert_eq!(image.width, 4);
+        assert_eq!(image.height, 3);
+        assert_eq!(image.pixels.len(), 4 * 3 * 3);
     }
 
     #[test]

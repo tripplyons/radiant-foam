@@ -1,5 +1,7 @@
 use crate::parameter::Parameter;
+use crate::renderer::{ImageData, PerspectiveCamera, PerspectiveRenderer, Renderer, RendererError};
 use crate::scene::{Scene, SceneError};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,6 +17,7 @@ pub struct VideoInitOptions {
     pub fps: f64,
     pub max_points: Option<usize>,
     pub initial_log_density: f64,
+    pub train_epochs: usize,
 }
 
 impl Default for VideoInitOptions {
@@ -23,6 +26,7 @@ impl Default for VideoInitOptions {
             fps: DEFAULT_FPS,
             max_points: Some(10_000),
             initial_log_density: DEFAULT_LOG_DENSITY,
+            train_epochs: 1,
         }
     }
 }
@@ -40,6 +44,15 @@ pub enum VideoInitError {
     MissingPointsFile(PathBuf),
     NoPoints(PathBuf),
     InvalidPointRecord(String),
+    MissingCameraFile(PathBuf),
+    MissingImageFile(PathBuf),
+    InvalidCameraRecord(String),
+    InvalidImageRecord(String),
+    MissingFrameImage(PathBuf),
+    UnsupportedCameraModel(String),
+    Renderer(RendererError),
+    Image(image::ImageError),
+    MissingCameraId(u32),
 }
 
 impl From<std::io::Error> for VideoInitError {
@@ -51,6 +64,18 @@ impl From<std::io::Error> for VideoInitError {
 impl From<SceneError> for VideoInitError {
     fn from(value: SceneError) -> Self {
         Self::Scene(value)
+    }
+}
+
+impl From<RendererError> for VideoInitError {
+    fn from(value: RendererError) -> Self {
+        Self::Renderer(value)
+    }
+}
+
+impl From<image::ImageError> for VideoInitError {
+    fn from(value: image::ImageError) -> Self {
+        Self::Image(value)
     }
 }
 
@@ -98,6 +123,27 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
         video_path: &Path,
         workspace: &Path,
     ) -> Result<Scene, VideoInitError> {
+        let workspace_layout = self.prepare_workspace(video_path, workspace)?;
+        load_scene_from_colmap_text_model(&workspace_layout.text_dir, &self.options)
+    }
+
+    pub fn initialize_and_train_from_video(
+        &mut self,
+        video_path: &Path,
+        workspace: &Path,
+    ) -> Result<Scene, VideoInitError> {
+        let workspace_layout = self.prepare_workspace(video_path, workspace)?;
+        let mut scene = load_scene_from_colmap_text_model(&workspace_layout.text_dir, &self.options)?;
+        let frames = load_training_frames(&workspace_layout.text_dir, &workspace_layout.frames_dir)?;
+        self.train_scene_on_frames(&mut scene, &frames)?;
+        Ok(scene)
+    }
+
+    fn prepare_workspace(
+        &mut self,
+        video_path: &Path,
+        workspace: &Path,
+    ) -> Result<WorkspaceLayout, VideoInitError> {
         fs::create_dir_all(workspace)?;
         let frames_dir = workspace.join("frames");
         let sparse_dir = workspace.join("sparse");
@@ -115,7 +161,7 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
 
         let sparse_model = first_sparse_model_dir(&sparse_dir)?;
         self.run_model_converter(&sparse_model, &text_dir)?;
-        load_scene_from_colmap_text_model(&text_dir, &self.options)
+        Ok(WorkspaceLayout { frames_dir, text_dir })
     }
 
     fn extract_frames(
@@ -205,6 +251,26 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
             ],
         )
     }
+
+    fn train_scene_on_frames(
+        &self,
+        scene: &mut Scene,
+        frames: &[TrainingFrame],
+    ) -> Result<(), VideoInitError> {
+        for _ in 0..self.options.train_epochs {
+            for frame in frames {
+                let renderer = PerspectiveRenderer::new(frame.camera.clone());
+                renderer.train_step(scene, &frame.target)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct WorkspaceLayout {
+    frames_dir: PathBuf,
+    text_dir: PathBuf,
 }
 
 fn path_arg(path: &Path) -> String {
@@ -287,10 +353,122 @@ fn load_scene_from_colmap_text_model(
     Ok(scene)
 }
 
+fn load_training_frames(
+    text_dir: &Path,
+    frames_dir: &Path,
+) -> Result<Vec<TrainingFrame>, VideoInitError> {
+    let cameras = load_cameras(&text_dir.join("cameras.txt"))?;
+    let images = load_registered_images(&text_dir.join("images.txt"))?;
+
+    images
+        .into_iter()
+        .map(|image| {
+            let camera_model = cameras
+                .get(&image.camera_id)
+                .ok_or(VideoInitError::MissingCameraId(image.camera_id))?;
+            let image_path = frames_dir.join(&image.name);
+            let target = load_target_image(&image_path)?;
+            Ok(TrainingFrame {
+                camera: camera_model.to_perspective_camera(image.world_to_camera_rotation, image.translation),
+                target,
+            })
+        })
+        .collect()
+}
+
+fn load_target_image(path: &Path) -> Result<ImageData, VideoInitError> {
+    if !path.exists() {
+        return Err(VideoInitError::MissingFrameImage(path.to_path_buf()));
+    }
+    let image = image::open(path)?.to_rgb8();
+    Ok(ImageData {
+        width: image.width(),
+        height: image.height(),
+        pixels: image.into_raw(),
+    })
+}
+
+fn load_cameras(path: &Path) -> Result<HashMap<u32, ColmapCameraModel>, VideoInitError> {
+    let contents =
+        fs::read_to_string(path).map_err(|_| VideoInitError::MissingCameraFile(path.to_path_buf()))?;
+    contents
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .map(parse_camera_record)
+        .map(|result| result.map(|camera| (camera.id, camera)))
+        .collect()
+}
+
+fn load_registered_images(path: &Path) -> Result<Vec<ColmapImageRecord>, VideoInitError> {
+    let contents =
+        fs::read_to_string(path).map_err(|_| VideoInitError::MissingImageFile(path.to_path_buf()))?;
+    let mut images = Vec::new();
+    let mut lines = contents.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        images.push(parse_image_record(trimmed)?);
+        let _ = lines.next();
+    }
+
+    Ok(images)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct SparsePoint {
     position: [f64; 3],
     color: [f64; 3],
+}
+
+#[derive(Clone, Debug)]
+struct TrainingFrame {
+    camera: PerspectiveCamera,
+    target: ImageData,
+}
+
+#[derive(Clone, Debug)]
+struct ColmapCameraModel {
+    id: u32,
+    width: u32,
+    height: u32,
+    focal_x: f64,
+    focal_y: f64,
+    principal_x: f64,
+    principal_y: f64,
+}
+
+impl ColmapCameraModel {
+    fn to_perspective_camera(
+        &self,
+        world_to_camera_rotation: [[f64; 3]; 3],
+        translation: [f64; 3],
+    ) -> PerspectiveCamera {
+        let camera_to_world = transpose(world_to_camera_rotation);
+        let origin_camera = [-translation[0], -translation[1], -translation[2]];
+        let origin = mat3_mul_vec3(camera_to_world, origin_camera);
+
+        PerspectiveCamera {
+            width: self.width,
+            height: self.height,
+            focal_x: self.focal_x,
+            focal_y: self.focal_y,
+            principal_x: self.principal_x,
+            principal_y: self.principal_y,
+            origin,
+            camera_to_world,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ColmapImageRecord {
+    camera_id: u32,
+    name: String,
+    world_to_camera_rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
 }
 
 fn parse_point_record(line: &str) -> Result<SparsePoint, VideoInitError> {
@@ -324,12 +502,140 @@ fn parse_point_record(line: &str) -> Result<SparsePoint, VideoInitError> {
     })
 }
 
+fn parse_camera_record(line: &str) -> Result<ColmapCameraModel, VideoInitError> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 5 {
+        return Err(VideoInitError::InvalidCameraRecord(line.to_string()));
+    }
+
+    let id = parse_field::<u32>(&fields, 0, line, VideoInitError::InvalidCameraRecord)?;
+    let model = fields[1];
+    let width = parse_field::<u32>(&fields, 2, line, VideoInitError::InvalidCameraRecord)?;
+    let height = parse_field::<u32>(&fields, 3, line, VideoInitError::InvalidCameraRecord)?;
+    let params = fields[4..]
+        .iter()
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .map_err(|_| VideoInitError::InvalidCameraRecord(line.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let (focal_x, focal_y, principal_x, principal_y) = match model {
+        "SIMPLE_PINHOLE" | "SIMPLE_RADIAL" | "RADIAL" => {
+            if params.len() < 3 {
+                return Err(VideoInitError::InvalidCameraRecord(line.to_string()));
+            }
+            (params[0], params[0], params[1], params[2])
+        }
+        "PINHOLE" | "OPENCV" | "FULL_OPENCV" => {
+            if params.len() < 4 {
+                return Err(VideoInitError::InvalidCameraRecord(line.to_string()));
+            }
+            (params[0], params[1], params[2], params[3])
+        }
+        other => return Err(VideoInitError::UnsupportedCameraModel(other.to_string())),
+    };
+
+    Ok(ColmapCameraModel {
+        id,
+        width,
+        height,
+        focal_x,
+        focal_y,
+        principal_x,
+        principal_y,
+    })
+}
+
+fn parse_image_record(line: &str) -> Result<ColmapImageRecord, VideoInitError> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 10 {
+        return Err(VideoInitError::InvalidImageRecord(line.to_string()));
+    }
+
+    let qw = parse_field::<f64>(&fields, 1, line, VideoInitError::InvalidImageRecord)?;
+    let qx = parse_field::<f64>(&fields, 2, line, VideoInitError::InvalidImageRecord)?;
+    let qy = parse_field::<f64>(&fields, 3, line, VideoInitError::InvalidImageRecord)?;
+    let qz = parse_field::<f64>(&fields, 4, line, VideoInitError::InvalidImageRecord)?;
+    let tx = parse_field::<f64>(&fields, 5, line, VideoInitError::InvalidImageRecord)?;
+    let ty = parse_field::<f64>(&fields, 6, line, VideoInitError::InvalidImageRecord)?;
+    let tz = parse_field::<f64>(&fields, 7, line, VideoInitError::InvalidImageRecord)?;
+    let camera_id = parse_field::<u32>(&fields, 8, line, VideoInitError::InvalidImageRecord)?;
+    let name = fields[9].to_string();
+
+    Ok(ColmapImageRecord {
+        camera_id,
+        name,
+        world_to_camera_rotation: quaternion_to_rotation_matrix([qw, qx, qy, qz]),
+        translation: [tx, ty, tz],
+    })
+}
+
+fn parse_field<T>(
+    fields: &[&str],
+    index: usize,
+    line: &str,
+    error_builder: fn(String) -> VideoInitError,
+) -> Result<T, VideoInitError>
+where
+    T: std::str::FromStr,
+{
+    fields[index]
+        .parse::<T>()
+        .map_err(|_| error_builder(line.to_string()))
+}
+
+fn quaternion_to_rotation_matrix(q: [f64; 4]) -> [[f64; 3]; 3] {
+    let [qw, qx, qy, qz] = q;
+    let norm = (qw * qw + qx * qx + qy * qy + qz * qz).sqrt();
+    let qw = qw / norm;
+    let qx = qx / norm;
+    let qy = qy / norm;
+    let qz = qz / norm;
+
+    [
+        [
+            1.0 - 2.0 * (qy * qy + qz * qz),
+            2.0 * (qx * qy - qz * qw),
+            2.0 * (qx * qz + qy * qw),
+        ],
+        [
+            2.0 * (qx * qy + qz * qw),
+            1.0 - 2.0 * (qx * qx + qz * qz),
+            2.0 * (qy * qz - qx * qw),
+        ],
+        [
+            2.0 * (qx * qz - qy * qw),
+            2.0 * (qy * qz + qx * qw),
+            1.0 - 2.0 * (qx * qx + qy * qy),
+        ],
+    ]
+}
+
+fn transpose(matrix: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    [
+        [matrix[0][0], matrix[1][0], matrix[2][0]],
+        [matrix[0][1], matrix[1][1], matrix[2][1]],
+        [matrix[0][2], matrix[1][2], matrix[2][2]],
+    ]
+}
+
+fn mat3_mul_vec3(matrix: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
+    [
+        matrix[0][0] * vector[0] + matrix[0][1] * vector[1] + matrix[0][2] * vector[2],
+        matrix[1][0] * vector[0] + matrix[1][1] * vector[1] + matrix[1][2] * vector[2],
+        matrix[2][0] * vector[0] + matrix[2][1] * vector[1] + matrix[2][2] * vector[2],
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ColmapVideoInitializer, CommandRunner, VideoInitError, VideoInitOptions,
-        load_scene_from_colmap_text_model,
+        load_cameras, load_registered_images, load_scene_from_colmap_text_model,
     };
+    use image::RgbImage;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -349,6 +655,18 @@ mod tests {
         fn run(&mut self, program: &str, args: &[String]) -> Result<(), VideoInitError> {
             self.calls.push((program.to_string(), args.to_vec()));
 
+            if program == "ffmpeg" {
+                let frame_pattern = PathBuf::from(args.last().expect("frame pattern should exist"));
+                let frames_dir = frame_pattern
+                    .parent()
+                    .expect("frame output should have parent")
+                    .to_path_buf();
+                fs::create_dir_all(&frames_dir)?;
+                RgbImage::from_raw(2, 2, vec![255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0])
+                    .expect("image should construct")
+                    .save(frames_dir.join("frame_00001.png"))?;
+            }
+
             if program == "colmap" && args.first().map(String::as_str) == Some("mapper") {
                 let sparse_dir = PathBuf::from(argument_value(args, "--output_path"));
                 fs::create_dir_all(sparse_dir.join("0"))?;
@@ -359,7 +677,15 @@ mod tests {
                 fs::create_dir_all(&text_dir)?;
                 fs::write(
                     text_dir.join("points3D.txt"),
-                    "# POINT3D_ID X Y Z R G B ERROR TRACK[]\n1 0.0 1.0 2.0 255 128 64 0.1\n2 -1.5 0.5 3.25 0 32 255 0.2\n",
+                    "# POINT3D_ID X Y Z R G B ERROR TRACK[]\n1 0.0 0.0 3.0 255 0 0 0.1\n2 0.5 0.1 4.0 255 0 0 0.2\n",
+                )?;
+                fs::write(
+                    text_dir.join("cameras.txt"),
+                    "# CAMERA_ID MODEL WIDTH HEIGHT PARAMS[]\n1 PINHOLE 2 2 2.0 2.0 1.0 1.0\n",
+                )?;
+                fs::write(
+                    text_dir.join("images.txt"),
+                    "# IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME\n1 1 0 0 0 0 0 0 1 frame_00001.png\n\n",
                 )?;
             }
 
@@ -409,6 +735,52 @@ mod tests {
         assert_eq!(initializer.runner.calls[2].1[0], "sequential_matcher");
         assert_eq!(initializer.runner.calls[3].1[0], "mapper");
         assert_eq!(initializer.runner.calls[4].1[0], "model_converter");
+
+        fs::remove_dir_all(temp_dir).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn colmap_text_model_loads_cameras_and_registered_images() {
+        let temp_dir = make_temp_dir("colmap-camera-load");
+        fs::write(
+            temp_dir.join("cameras.txt"),
+            "# header\n1 SIMPLE_RADIAL 640 480 500 320 240 0.1\n",
+        )
+        .expect("camera file should write");
+        fs::write(
+            temp_dir.join("images.txt"),
+            "# header\n1 1 0 0 0 0 0 -1 1 frame_00001.png\n0.0 0.0 -1\n",
+        )
+        .expect("images file should write");
+
+        let cameras = load_cameras(&temp_dir.join("cameras.txt")).expect("cameras should parse");
+        let images =
+            load_registered_images(&temp_dir.join("images.txt")).expect("images should parse");
+
+        assert_eq!(cameras.len(), 1);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].name, "frame_00001.png");
+        assert_eq!(images[0].camera_id, 1);
+
+        fs::remove_dir_all(temp_dir).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn initializer_can_train_scene_from_registered_frames() {
+        let temp_dir = make_temp_dir("video-train");
+        let video_path = temp_dir.join("scene.mp4");
+        fs::write(&video_path, "placeholder").expect("video placeholder should write");
+
+        let mut options = VideoInitOptions::default();
+        options.train_epochs = 1;
+        let runner = FakeRunner::new();
+        let mut initializer = ColmapVideoInitializer::new(runner, options);
+        let scene = initializer
+            .initialize_and_train_from_video(&video_path, &temp_dir.join("workspace"))
+            .expect("video training should succeed");
+
+        assert_eq!(scene.centroid_x.step, 1);
+        assert_eq!(scene.centroid_r.step, 1);
 
         fs::remove_dir_all(temp_dir).expect("temp dir should clean up");
     }

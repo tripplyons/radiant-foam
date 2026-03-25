@@ -12,8 +12,17 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     let args = env::args().collect::<Vec<_>>();
+    if args.len() == 2 {
+        run_video_training(Path::new(&args[1]));
+        return;
+    }
+
     if args.get(1).map(String::as_str) == Some("init-video") {
         run_video_initialization(&args);
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("train-video") {
+        run_explicit_video_training(&args);
         return;
     }
 
@@ -58,5 +67,40 @@ fn run_video_initialization(args: &[String]) {
         .expect("video initialization should succeed");
     scene
         .save_to_json(scene_path)
+        .expect("scene should serialize");
+}
+
+fn run_explicit_video_training(args: &[String]) {
+    if args.len() != 4 && args.len() != 5 {
+        eprintln!("usage: radiant-foam train-video <video-path> <scene-json> [workspace-dir]");
+        std::process::exit(1);
+    }
+
+    let video_path = Path::new(&args[2]);
+    let scene_path = Path::new(&args[3]);
+    let workspace = args
+        .get(4)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| scene_path.with_extension("colmap"));
+
+    let mut initializer = ColmapVideoInitializer::default();
+    let scene = initializer
+        .initialize_and_train_from_video(video_path, &workspace)
+        .expect("video training should succeed");
+    scene
+        .save_to_json(scene_path)
+        .expect("scene should serialize");
+}
+
+fn run_video_training(video_path: &Path) {
+    let scene_path = video_path.with_extension("scene.json");
+    let workspace = video_path.with_extension("radiant-foam");
+
+    let mut initializer = ColmapVideoInitializer::default();
+    let scene = initializer
+        .initialize_and_train_from_video(video_path, &workspace)
+        .expect("video training should succeed");
+    scene
+        .save_to_json(&scene_path)
         .expect("scene should serialize");
 }
