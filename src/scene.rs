@@ -1,13 +1,16 @@
 use crate::parameter::{Parameter, ParameterError};
 use rand::RngExt;
+use serde::{Deserialize, Serialize};
+use std::fs;
 use std::f64::consts::TAU;
+use std::path::Path;
 
 const SPLIT_FALLBACK_OFFSET_MAGNITUDE: f64 = 1e-3;
 const SPLIT_SAMPLING_ATTEMPTS: usize = 64;
 const RAY_ADVANCE_EPSILON: f64 = 1e-9;
 const TRANSMITTANCE_EPSILON: f64 = 1e-6;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Scene {
     pub centroid_x: Parameter,
     pub centroid_y: Parameter,
@@ -19,7 +22,7 @@ pub struct Scene {
     pub centroid_neighbors: Vec<Vec<usize>>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum SceneError {
     NegativeScale(f64),
     InconsistentCentroidData {
@@ -42,6 +45,8 @@ pub enum SceneError {
     },
     EmptyScene,
     InvalidRayDirection,
+    Io(std::io::Error),
+    SerializationFailed,
 }
 
 impl Scene {
@@ -83,6 +88,18 @@ impl Scene {
             centroid_b: Parameter::new(b, learning_rate, beta1, beta2),
             centroid_neighbors: vec![Vec::new(); count],
         })
+    }
+
+    pub fn save_to_json(&self, path: &Path) -> Result<(), SceneError> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|_| SceneError::SerializationFailed)?;
+        fs::write(path, json).map_err(SceneError::Io)?;
+        Ok(())
+    }
+
+    pub fn load_from_json(path: &Path) -> Result<Self, SceneError> {
+        let json = fs::read_to_string(path).map_err(SceneError::Io)?;
+        serde_json::from_str(&json).map_err(|_| SceneError::SerializationFailed)
     }
 
     pub fn compute_neighbors(&mut self) -> Result<(), SceneError> {
@@ -536,6 +553,8 @@ fn remove_neighbor(neighbors: &mut Vec<usize>, value: usize) {
 mod tests {
     use super::{Scene, SceneError, dist_sq};
     use crate::parameter::Parameter;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn new_random_creates_expected_number_of_centroids() {
@@ -774,5 +793,43 @@ mod tests {
         let scene = Scene::new_random(1, 1.0).expect("valid");
         let result = scene.render([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
         assert!(matches!(result, Err(SceneError::InvalidRayDirection)));
+    }
+
+    #[test]
+    fn scene_json_round_trip_preserves_centroid_data() {
+        let mut scene = Scene::new_random(3, 1.0).expect("valid");
+        scene.compute_neighbors().expect("neighbors should compute");
+        let path = std::env::temp_dir().join(format!(
+            "radiant-foam-scene-{}.json",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should advance")
+                .as_nanos()
+        ));
+
+        scene.save_to_json(&path).expect("scene should save");
+        let loaded = Scene::load_from_json(&path).expect("scene should load");
+
+        assert!(scene
+            .centroid_x
+            .values
+            .iter()
+            .zip(&loaded.centroid_x.values)
+            .all(|(lhs, rhs)| (lhs - rhs).abs() < 1e-12));
+        assert!(scene
+            .centroid_y
+            .values
+            .iter()
+            .zip(&loaded.centroid_y.values)
+            .all(|(lhs, rhs)| (lhs - rhs).abs() < 1e-12));
+        assert!(scene
+            .centroid_z
+            .values
+            .iter()
+            .zip(&loaded.centroid_z.values)
+            .all(|(lhs, rhs)| (lhs - rhs).abs() < 1e-12));
+        assert_eq!(scene.centroid_neighbors, loaded.centroid_neighbors);
+
+        fs::remove_file(path).expect("json should clean up");
     }
 }

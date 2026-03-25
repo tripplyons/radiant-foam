@@ -1,0 +1,433 @@
+use crate::parameter::Parameter;
+use crate::scene::{Scene, SceneError};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const DEFAULT_FPS: f64 = 2.0;
+const DEFAULT_LOG_DENSITY: f64 = -3.0;
+const DEFAULT_LEARNING_RATE: f64 = 1e-3;
+const DEFAULT_BETA1: f64 = 0.9;
+const DEFAULT_BETA2: f64 = 0.999;
+
+#[derive(Clone, Debug)]
+pub struct VideoInitOptions {
+    pub fps: f64,
+    pub max_points: Option<usize>,
+    pub initial_log_density: f64,
+}
+
+impl Default for VideoInitOptions {
+    fn default() -> Self {
+        Self {
+            fps: DEFAULT_FPS,
+            max_points: Some(10_000),
+            initial_log_density: DEFAULT_LOG_DENSITY,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum VideoInitError {
+    Io(std::io::Error),
+    Scene(SceneError),
+    CommandFailed {
+        program: String,
+        args: Vec<String>,
+        status: std::process::ExitStatus,
+    },
+    MissingSparseModel(PathBuf),
+    MissingPointsFile(PathBuf),
+    NoPoints(PathBuf),
+    InvalidPointRecord(String),
+}
+
+impl From<std::io::Error> for VideoInitError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<SceneError> for VideoInitError {
+    fn from(value: SceneError) -> Self {
+        Self::Scene(value)
+    }
+}
+
+pub trait CommandRunner {
+    fn run(&mut self, program: &str, args: &[String]) -> Result<(), VideoInitError>;
+}
+
+#[derive(Debug, Default)]
+pub struct SystemCommandRunner;
+
+impl CommandRunner for SystemCommandRunner {
+    fn run(&mut self, program: &str, args: &[String]) -> Result<(), VideoInitError> {
+        let status = Command::new(program).args(args).status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(VideoInitError::CommandFailed {
+                program: program.to_string(),
+                args: args.to_vec(),
+                status,
+            })
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ColmapVideoInitializer<R> {
+    runner: R,
+    options: VideoInitOptions,
+}
+
+impl Default for ColmapVideoInitializer<SystemCommandRunner> {
+    fn default() -> Self {
+        Self::new(SystemCommandRunner, VideoInitOptions::default())
+    }
+}
+
+impl<R: CommandRunner> ColmapVideoInitializer<R> {
+    pub fn new(runner: R, options: VideoInitOptions) -> Self {
+        Self { runner, options }
+    }
+
+    pub fn initialize_scene_from_video(
+        &mut self,
+        video_path: &Path,
+        workspace: &Path,
+    ) -> Result<Scene, VideoInitError> {
+        fs::create_dir_all(workspace)?;
+        let frames_dir = workspace.join("frames");
+        let sparse_dir = workspace.join("sparse");
+        let text_dir = workspace.join("text");
+        let database_path = workspace.join("database.db");
+
+        fs::create_dir_all(&frames_dir)?;
+        fs::create_dir_all(&sparse_dir)?;
+        fs::create_dir_all(&text_dir)?;
+
+        self.extract_frames(video_path, &frames_dir)?;
+        self.run_feature_extractor(&database_path, &frames_dir)?;
+        self.run_sequential_matcher(&database_path)?;
+        self.run_mapper(&database_path, &frames_dir, &sparse_dir)?;
+
+        let sparse_model = first_sparse_model_dir(&sparse_dir)?;
+        self.run_model_converter(&sparse_model, &text_dir)?;
+        load_scene_from_colmap_text_model(&text_dir, &self.options)
+    }
+
+    fn extract_frames(
+        &mut self,
+        video_path: &Path,
+        frames_dir: &Path,
+    ) -> Result<(), VideoInitError> {
+        let frame_pattern = frames_dir.join("frame_%05d.png");
+        self.runner.run(
+            "ffmpeg",
+            &[
+                "-y".to_string(),
+                "-i".to_string(),
+                path_arg(video_path),
+                "-vf".to_string(),
+                format!("fps={}", self.options.fps),
+                path_arg(&frame_pattern),
+            ],
+        )
+    }
+
+    fn run_feature_extractor(
+        &mut self,
+        database_path: &Path,
+        frames_dir: &Path,
+    ) -> Result<(), VideoInitError> {
+        self.runner.run(
+            "colmap",
+            &[
+                "feature_extractor".to_string(),
+                "--database_path".to_string(),
+                path_arg(database_path),
+                "--image_path".to_string(),
+                path_arg(frames_dir),
+                "--ImageReader.single_camera".to_string(),
+                "1".to_string(),
+            ],
+        )
+    }
+
+    fn run_sequential_matcher(&mut self, database_path: &Path) -> Result<(), VideoInitError> {
+        self.runner.run(
+            "colmap",
+            &[
+                "sequential_matcher".to_string(),
+                "--database_path".to_string(),
+                path_arg(database_path),
+            ],
+        )
+    }
+
+    fn run_mapper(
+        &mut self,
+        database_path: &Path,
+        frames_dir: &Path,
+        sparse_dir: &Path,
+    ) -> Result<(), VideoInitError> {
+        self.runner.run(
+            "colmap",
+            &[
+                "mapper".to_string(),
+                "--database_path".to_string(),
+                path_arg(database_path),
+                "--image_path".to_string(),
+                path_arg(frames_dir),
+                "--output_path".to_string(),
+                path_arg(sparse_dir),
+            ],
+        )
+    }
+
+    fn run_model_converter(
+        &mut self,
+        sparse_model: &Path,
+        text_dir: &Path,
+    ) -> Result<(), VideoInitError> {
+        self.runner.run(
+            "colmap",
+            &[
+                "model_converter".to_string(),
+                "--input_path".to_string(),
+                path_arg(sparse_model),
+                "--output_path".to_string(),
+                path_arg(text_dir),
+                "--output_type".to_string(),
+                "TXT".to_string(),
+            ],
+        )
+    }
+}
+
+fn path_arg(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn first_sparse_model_dir(sparse_root: &Path) -> Result<PathBuf, VideoInitError> {
+    let mut candidates = fs::read_dir(sparse_root)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| VideoInitError::MissingSparseModel(sparse_root.to_path_buf()))
+}
+
+fn load_scene_from_colmap_text_model(
+    text_dir: &Path,
+    options: &VideoInitOptions,
+) -> Result<Scene, VideoInitError> {
+    let points_path = text_dir.join("points3D.txt");
+    let contents = fs::read_to_string(&points_path)
+        .map_err(|_| VideoInitError::MissingPointsFile(points_path.clone()))?;
+    let mut points = contents
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .map(parse_point_record)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if let Some(max_points) = options.max_points {
+        if points.len() > max_points {
+            let stride = points.len() as f64 / max_points as f64;
+            points = (0..max_points)
+                .map(|index| points[(index as f64 * stride).floor() as usize])
+                .collect();
+        }
+    }
+
+    if points.is_empty() {
+        return Err(VideoInitError::NoPoints(points_path));
+    }
+
+    let count = points.len();
+    let mut x = Vec::with_capacity(count);
+    let mut y = Vec::with_capacity(count);
+    let mut z = Vec::with_capacity(count);
+    let mut opacity = Vec::with_capacity(count);
+    let mut r = Vec::with_capacity(count);
+    let mut g = Vec::with_capacity(count);
+    let mut b = Vec::with_capacity(count);
+
+    for point in points {
+        x.push(point.position[0]);
+        y.push(point.position[1]);
+        z.push(point.position[2]);
+        opacity.push(options.initial_log_density);
+        r.push(point.color[0]);
+        g.push(point.color[1]);
+        b.push(point.color[2]);
+    }
+
+    let mut scene = Scene {
+        centroid_x: Parameter::new(x, DEFAULT_LEARNING_RATE, DEFAULT_BETA1, DEFAULT_BETA2),
+        centroid_y: Parameter::new(y, DEFAULT_LEARNING_RATE, DEFAULT_BETA1, DEFAULT_BETA2),
+        centroid_z: Parameter::new(z, DEFAULT_LEARNING_RATE, DEFAULT_BETA1, DEFAULT_BETA2),
+        centroid_opacity: Parameter::new(
+            opacity,
+            DEFAULT_LEARNING_RATE,
+            DEFAULT_BETA1,
+            DEFAULT_BETA2,
+        ),
+        centroid_r: Parameter::new(r, DEFAULT_LEARNING_RATE, DEFAULT_BETA1, DEFAULT_BETA2),
+        centroid_g: Parameter::new(g, DEFAULT_LEARNING_RATE, DEFAULT_BETA1, DEFAULT_BETA2),
+        centroid_b: Parameter::new(b, DEFAULT_LEARNING_RATE, DEFAULT_BETA1, DEFAULT_BETA2),
+        centroid_neighbors: vec![Vec::new(); count],
+    };
+    scene.compute_neighbors()?;
+    Ok(scene)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SparsePoint {
+    position: [f64; 3],
+    color: [f64; 3],
+}
+
+fn parse_point_record(line: &str) -> Result<SparsePoint, VideoInitError> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 7 {
+        return Err(VideoInitError::InvalidPointRecord(line.to_string()));
+    }
+
+    let x = fields[1]
+        .parse::<f64>()
+        .map_err(|_| VideoInitError::InvalidPointRecord(line.to_string()))?;
+    let y = fields[2]
+        .parse::<f64>()
+        .map_err(|_| VideoInitError::InvalidPointRecord(line.to_string()))?;
+    let z = fields[3]
+        .parse::<f64>()
+        .map_err(|_| VideoInitError::InvalidPointRecord(line.to_string()))?;
+    let r = fields[4]
+        .parse::<f64>()
+        .map_err(|_| VideoInitError::InvalidPointRecord(line.to_string()))?;
+    let g = fields[5]
+        .parse::<f64>()
+        .map_err(|_| VideoInitError::InvalidPointRecord(line.to_string()))?;
+    let b = fields[6]
+        .parse::<f64>()
+        .map_err(|_| VideoInitError::InvalidPointRecord(line.to_string()))?;
+
+    Ok(SparsePoint {
+        position: [x, y, z],
+        color: [r / 255.0, g / 255.0, b / 255.0],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ColmapVideoInitializer, CommandRunner, VideoInitError, VideoInitOptions,
+        load_scene_from_colmap_text_model,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Debug)]
+    struct FakeRunner {
+        calls: Vec<(String, Vec<String>)>,
+    }
+
+    impl FakeRunner {
+        fn new() -> Self {
+            Self { calls: Vec::new() }
+        }
+    }
+
+    impl CommandRunner for FakeRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), VideoInitError> {
+            self.calls.push((program.to_string(), args.to_vec()));
+
+            if program == "colmap" && args.first().map(String::as_str) == Some("mapper") {
+                let sparse_dir = PathBuf::from(argument_value(args, "--output_path"));
+                fs::create_dir_all(sparse_dir.join("0"))?;
+            }
+
+            if program == "colmap" && args.first().map(String::as_str) == Some("model_converter") {
+                let text_dir = PathBuf::from(argument_value(args, "--output_path"));
+                fs::create_dir_all(&text_dir)?;
+                fs::write(
+                    text_dir.join("points3D.txt"),
+                    "# POINT3D_ID X Y Z R G B ERROR TRACK[]\n1 0.0 1.0 2.0 255 128 64 0.1\n2 -1.5 0.5 3.25 0 32 255 0.2\n",
+                )?;
+            }
+
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn load_scene_from_colmap_points_assigns_positions_and_colors() {
+        let temp_dir = make_temp_dir("colmap-points");
+        fs::write(
+            temp_dir.join("points3D.txt"),
+            "# header\n1 1.0 2.0 3.0 255 0 128 0.5\n2 -1.0 0.0 4.0 0 255 64 0.25\n",
+        )
+        .expect("point file should write");
+
+        let scene = load_scene_from_colmap_text_model(&temp_dir, &VideoInitOptions::default())
+            .expect("scene should parse");
+
+        assert_eq!(scene.centroid_x.values, vec![1.0, -1.0]);
+        assert_eq!(scene.centroid_y.values, vec![2.0, 0.0]);
+        assert_eq!(scene.centroid_z.values, vec![3.0, 4.0]);
+        assert!((scene.centroid_r.values[0] - 1.0).abs() < 1e-9);
+        assert!((scene.centroid_g.values[1] - 1.0).abs() < 1e-9);
+        assert!((scene.centroid_b.values[0] - (128.0 / 255.0)).abs() < 1e-9);
+
+        fs::remove_dir_all(temp_dir).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn initializer_runs_ffmpeg_and_colmap_pipeline() {
+        let temp_dir = make_temp_dir("video-init");
+        let video_path = temp_dir.join("scene.mp4");
+        fs::write(&video_path, "placeholder").expect("video placeholder should write");
+
+        let runner = FakeRunner::new();
+        let mut initializer = ColmapVideoInitializer::new(runner, VideoInitOptions::default());
+        let scene = initializer
+            .initialize_scene_from_video(&video_path, &temp_dir.join("workspace"))
+            .expect("initialization should succeed");
+
+        assert_eq!(scene.centroid_x.len(), 2);
+        assert_eq!(initializer.runner.calls.len(), 5);
+        assert_eq!(initializer.runner.calls[0].0, "ffmpeg");
+        assert_eq!(initializer.runner.calls[1].0, "colmap");
+        assert_eq!(initializer.runner.calls[1].1[0], "feature_extractor");
+        assert_eq!(initializer.runner.calls[2].1[0], "sequential_matcher");
+        assert_eq!(initializer.runner.calls[3].1[0], "mapper");
+        assert_eq!(initializer.runner.calls[4].1[0], "model_converter");
+
+        fs::remove_dir_all(temp_dir).expect("temp dir should clean up");
+    }
+
+    fn argument_value<'a>(args: &'a [String], flag: &str) -> &'a str {
+        let index = args
+            .iter()
+            .position(|arg| arg == flag)
+            .expect("flag should exist");
+        &args[index + 1]
+    }
+
+    fn make_temp_dir(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should advance")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("radiant-foam-{name}-{suffix}"));
+        fs::create_dir_all(&path).expect("temp dir should create");
+        path
+    }
+}

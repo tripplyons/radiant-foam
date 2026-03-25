@@ -1,9 +1,11 @@
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, PartialEq)]
 pub enum ParameterError {
     GradientLengthMismatch { expected: usize, got: usize },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Parameter {
     pub values: Vec<f64>,
     pub m: Vec<f64>,
