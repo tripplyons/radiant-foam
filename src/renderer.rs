@@ -126,6 +126,12 @@ struct RaySegment {
     sigma: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TraversalMode {
+    NeighborGraph,
+    AllCentroids,
+}
+
 pub trait Renderer {
     fn render(&self, scene: &Scene) -> Result<ImageData, RendererError>;
     fn train_step(
@@ -276,7 +282,7 @@ impl OrthographicRenderer {
     }
 
     fn render_linear(&self, scene: &Scene) -> Result<Vec<f64>, RendererError> {
-        validate_scene(scene)?;
+        validate_scene_for_render(scene)?;
         let plan = OrthographicRenderPlan::build(self)?;
         let mut pixels = vec![0.0_f64; (self.width as usize) * (self.height as usize) * 3];
         let row_stride = (self.width as usize) * 3;
@@ -287,7 +293,13 @@ impl OrthographicRenderer {
                 let mut scratch = RayTraceScratch::default();
                 for px in 0..self.width {
                     let start = plan.start(px, py);
-                    let color = trace_ray_validated(scene, start, plan.direction, &mut scratch);
+                    let color = trace_ray(
+                        scene,
+                        start,
+                        plan.direction,
+                        &mut scratch,
+                        TraversalMode::NeighborGraph,
+                    );
 
                     let idx = (px as usize) * 3;
                     row[idx] = color[0];
@@ -331,7 +343,7 @@ impl OrthographicRenderer {
         target: &ImageData,
     ) -> Result<TrainStepResult, RendererError> {
         self.validate_target(target)?;
-        let count = validate_scene(scene)?;
+        let count = validate_scene_points(scene)?;
         let plan = OrthographicRenderPlan::build(self)?;
 
         let normalizer = 2.0 / ((self.width as usize * self.height as usize * 3) as f64);
@@ -346,8 +358,13 @@ impl OrthographicRenderer {
                 let mut scratch = RayTraceScratch::default();
                 for px in 0..self.width {
                     let start = plan.start(px, py);
-                    let pixel_color =
-                        trace_ray_validated(scene, start, plan.direction, &mut scratch);
+                    let pixel_color = trace_ray(
+                        scene,
+                        start,
+                        plan.direction,
+                        &mut scratch,
+                        TraversalMode::AllCentroids,
+                    );
                     let pixel_index = ((py * self.width + px) as usize) * 3;
                     let target_rgb = [
                         target.pixels[pixel_index] as f64 * target_scale,
@@ -420,7 +437,7 @@ impl PerspectiveRenderer {
     }
 
     fn render_linear(&self, scene: &Scene) -> Result<Vec<f64>, RendererError> {
-        validate_scene(scene)?;
+        validate_scene_for_render(scene)?;
         let plan = PerspectiveRenderPlan::build(&self.camera);
         let mut pixels =
             vec![0.0_f64; (self.camera.width as usize) * (self.camera.height as usize) * 3];
@@ -432,7 +449,13 @@ impl PerspectiveRenderer {
                 let mut scratch = RayTraceScratch::default();
                 for px in 0..self.camera.width {
                     let (start, direction) = plan.ray(px, py);
-                    let color = trace_ray_validated(scene, start, direction, &mut scratch);
+                    let color = trace_ray(
+                        scene,
+                        start,
+                        direction,
+                        &mut scratch,
+                        TraversalMode::NeighborGraph,
+                    );
 
                     let idx = (px as usize) * 3;
                     row[idx] = color[0];
@@ -460,7 +483,7 @@ impl PerspectiveRenderer {
         target: &ImageData,
     ) -> Result<TrainStepResult, RendererError> {
         self.validate_target(target)?;
-        let count = validate_scene(scene)?;
+        let count = validate_scene_points(scene)?;
         let plan = PerspectiveRenderPlan::build(&self.camera);
 
         let normalizer =
@@ -476,7 +499,13 @@ impl PerspectiveRenderer {
                 let mut scratch = RayTraceScratch::default();
                 for px in 0..self.camera.width {
                     let (start, direction) = plan.ray(px, py);
-                    let pixel_color = trace_ray_validated(scene, start, direction, &mut scratch);
+                    let pixel_color = trace_ray(
+                        scene,
+                        start,
+                        direction,
+                        &mut scratch,
+                        TraversalMode::AllCentroids,
+                    );
                     let pixel_index = ((py * self.camera.width + px) as usize) * 3;
                     let target_rgb = [
                         target.pixels[pixel_index] as f64 * target_scale,
@@ -547,19 +576,8 @@ impl Renderer for OrthographicRenderer {
         scene: &mut Scene,
         target: &ImageData,
     ) -> Result<TrainStepResult, RendererError> {
-        let result = self.compute_training_signal(scene, target)?;
-
-        scene.centroid_x.update_adam(&result.gradients.centroid_x)?;
-        scene.centroid_y.update_adam(&result.gradients.centroid_y)?;
-        scene.centroid_z.update_adam(&result.gradients.centroid_z)?;
-        scene
-            .centroid_opacity
-            .update_adam(&result.gradients.centroid_opacity)?;
-        scene.centroid_r.update_adam(&result.gradients.centroid_r)?;
-        scene.centroid_g.update_adam(&result.gradients.centroid_g)?;
-        scene.centroid_b.update_adam(&result.gradients.centroid_b)?;
+        let result = self.train_step_without_neighbor_refresh(scene, target)?;
         scene.compute_neighbors()?;
-
         Ok(result)
     }
 }
@@ -587,19 +605,32 @@ impl Renderer for PerspectiveRenderer {
         scene: &mut Scene,
         target: &ImageData,
     ) -> Result<TrainStepResult, RendererError> {
-        let result = self.compute_training_signal(scene, target)?;
-
-        scene.centroid_x.update_adam(&result.gradients.centroid_x)?;
-        scene.centroid_y.update_adam(&result.gradients.centroid_y)?;
-        scene.centroid_z.update_adam(&result.gradients.centroid_z)?;
-        scene
-            .centroid_opacity
-            .update_adam(&result.gradients.centroid_opacity)?;
-        scene.centroid_r.update_adam(&result.gradients.centroid_r)?;
-        scene.centroid_g.update_adam(&result.gradients.centroid_g)?;
-        scene.centroid_b.update_adam(&result.gradients.centroid_b)?;
+        let result = self.train_step_without_neighbor_refresh(scene, target)?;
         scene.compute_neighbors()?;
+        Ok(result)
+    }
+}
 
+impl OrthographicRenderer {
+    pub fn train_step_without_neighbor_refresh(
+        &self,
+        scene: &mut Scene,
+        target: &ImageData,
+    ) -> Result<TrainStepResult, RendererError> {
+        let result = self.compute_training_signal(scene, target)?;
+        apply_gradients(scene, &result.gradients)?;
+        Ok(result)
+    }
+}
+
+impl PerspectiveRenderer {
+    pub fn train_step_without_neighbor_refresh(
+        &self,
+        scene: &mut Scene,
+        target: &ImageData,
+    ) -> Result<TrainStepResult, RendererError> {
+        let result = self.compute_training_signal(scene, target)?;
+        apply_gradients(scene, &result.gradients)?;
         Ok(result)
     }
 }
@@ -619,6 +650,19 @@ fn validate_target_dimensions(
             got_height: target.height,
         })
     }
+}
+
+fn apply_gradients(scene: &mut Scene, gradients: &SceneGradients) -> Result<(), RendererError> {
+    scene.centroid_x.update_adam(&gradients.centroid_x)?;
+    scene.centroid_y.update_adam(&gradients.centroid_y)?;
+    scene.centroid_z.update_adam(&gradients.centroid_z)?;
+    scene
+        .centroid_opacity
+        .update_adam(&gradients.centroid_opacity)?;
+    scene.centroid_r.update_adam(&gradients.centroid_r)?;
+    scene.centroid_g.update_adam(&gradients.centroid_g)?;
+    scene.centroid_b.update_adam(&gradients.centroid_b)?;
+    Ok(())
 }
 
 fn add_vec_in_place(target: &mut [f64], source: &[f64]) {
@@ -736,7 +780,7 @@ fn distortion_loss_and_gradients(scratch: &mut RayTraceScratch) -> f64 {
     loss
 }
 
-fn validate_scene(scene: &Scene) -> Result<usize, SceneError> {
+fn validate_scene_points(scene: &Scene) -> Result<usize, SceneError> {
     let x = scene.centroid_x.len();
     let y = scene.centroid_y.len();
     let z = scene.centroid_z.len();
@@ -759,6 +803,11 @@ fn validate_scene(scene: &Scene) -> Result<usize, SceneError> {
     if x == 0 {
         return Err(SceneError::EmptyScene);
     }
+    Ok(x)
+}
+
+fn validate_scene_for_render(scene: &Scene) -> Result<usize, SceneError> {
+    let x = validate_scene_points(scene)?;
     if scene.centroid_neighbors.len() != x {
         return Err(SceneError::InconsistentNeighborData {
             expected: x,
@@ -769,11 +818,12 @@ fn validate_scene(scene: &Scene) -> Result<usize, SceneError> {
     Ok(x)
 }
 
-fn trace_ray_validated(
+fn trace_ray(
     scene: &Scene,
     ray_origin: [f64; 3],
     direction: [f64; 3],
     scratch: &mut RayTraceScratch,
+    traversal_mode: TraversalMode,
 ) -> [f64; 3] {
     let mut color = [0.0, 0.0, 0.0];
     let mut remaining = 1.0_f64;
@@ -782,7 +832,8 @@ fn trace_ray_validated(
     scratch.segments.clear();
 
     while remaining > TRANSMITTANCE_EPSILON {
-        let next = next_centroid_along_ray(scene, current, ray_origin, direction, t0);
+        let next =
+            next_centroid_along_ray(scene, current, ray_origin, direction, t0, traversal_mode);
         let centroid_color = centroid_color(scene, current);
         let log_density = scene.centroid_opacity.values[current];
         let sigma = log_density.exp();
@@ -1006,6 +1057,28 @@ fn next_centroid_along_ray(
     ray_origin: [f64; 3],
     direction: [f64; 3],
     t0: f64,
+    traversal_mode: TraversalMode,
+) -> Option<(usize, f64)> {
+    match traversal_mode {
+        TraversalMode::NeighborGraph => next_centroid_along_ray_neighbors(
+            scene,
+            current,
+            ray_origin,
+            direction,
+            t0,
+        ),
+        TraversalMode::AllCentroids => {
+            next_centroid_along_ray_all(scene, current, ray_origin, direction, t0)
+        }
+    }
+}
+
+fn next_centroid_along_ray_neighbors(
+    scene: &Scene,
+    current: usize,
+    ray_origin: [f64; 3],
+    direction: [f64; 3],
+    t0: f64,
 ) -> Option<(usize, f64)> {
     let mut best: Option<(usize, f64)> = None;
     let pi = point(scene, current);
@@ -1029,6 +1102,46 @@ fn next_centroid_along_ray(
         match best {
             None => best = Some((neighbor, t)),
             Some((_, best_t)) if t < best_t => best = Some((neighbor, t)),
+            _ => {}
+        }
+    }
+
+    best
+}
+
+fn next_centroid_along_ray_all(
+    scene: &Scene,
+    current: usize,
+    ray_origin: [f64; 3],
+    direction: [f64; 3],
+    t0: f64,
+) -> Option<(usize, f64)> {
+    let mut best: Option<(usize, f64)> = None;
+    let pi = point(scene, current);
+    let oi = dot(pi, pi);
+
+    for candidate in 0..scene.centroid_x.len() {
+        if candidate == current {
+            continue;
+        }
+
+        let pj = point(scene, candidate);
+        let rhs = dot(pj, pj) - oi;
+        let delta = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
+        let denominator = 2.0 * dot(delta, direction);
+        if denominator.abs() < 1e-8 || denominator <= 0.0 {
+            continue;
+        }
+
+        let numerator = rhs - 2.0 * dot(delta, ray_origin);
+        let t = numerator / denominator;
+        if t <= t0 + RAY_ADVANCE_EPSILON {
+            continue;
+        }
+
+        match best {
+            None => best = Some((candidate, t)),
+            Some((_, best_t)) if t < best_t => best = Some((candidate, t)),
             _ => {}
         }
     }
@@ -1146,6 +1259,21 @@ mod tests {
         assert_eq!(scene.centroid_r.step, 1);
         assert_eq!(scene.centroid_g.step, 1);
         assert_eq!(scene.centroid_b.step, 1);
+    }
+
+    #[test]
+    fn train_step_succeeds_with_stale_neighbor_topology() {
+        let mut scene = gradient_test_scene();
+        scene.centroid_neighbors.clear();
+        let target = target_image(&gradient_test_renderer());
+        let renderer = gradient_test_renderer();
+
+        let result = renderer
+            .train_step(&mut scene, &target)
+            .expect("train step should rebuild render topology");
+
+        assert!(result.loss.is_finite());
+        assert_eq!(scene.centroid_neighbors.len(), scene.centroid_x.len());
     }
 
     #[test]
