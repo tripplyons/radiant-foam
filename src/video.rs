@@ -6,12 +6,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const DEFAULT_FPS: f64 = 2.0;
+const DEFAULT_FPS: f64 = 4.0;
 const DEFAULT_LOG_DENSITY: f64 = -3.0;
 const DEFAULT_DISTORTION_LAMBDA: f64 = 1e-2;
 const DEFAULT_LEARNING_RATE: f64 = 1e-3;
 const DEFAULT_BETA1: f64 = 0.9;
 const DEFAULT_BETA2: f64 = 0.999;
+const DEFAULT_TRAIN_EPOCHS: usize = 10;
 
 #[derive(Clone, Debug)]
 pub struct VideoInitOptions {
@@ -28,7 +29,7 @@ impl Default for VideoInitOptions {
             fps: DEFAULT_FPS,
             max_points: Some(10_000),
             initial_log_density: DEFAULT_LOG_DENSITY,
-            train_epochs: 1,
+            train_epochs: DEFAULT_TRAIN_EPOCHS,
             distortion_lambda: DEFAULT_DISTORTION_LAMBDA,
         }
     }
@@ -56,6 +57,10 @@ pub enum VideoInitError {
     Renderer(RendererError),
     Image(image::ImageError),
     MissingCameraId(u32),
+    TooFewRegisteredFrames {
+        extracted_frames: usize,
+        registered_frames: usize,
+    },
 }
 
 impl From<std::io::Error> for VideoInitError {
@@ -147,12 +152,15 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
         video_path: &Path,
         workspace: &Path,
     ) -> Result<WorkspaceLayout, VideoInitError> {
-        fs::create_dir_all(workspace)?;
         let frames_dir = workspace.join("frames");
         let sparse_dir = workspace.join("sparse");
         let text_dir = workspace.join("text");
         let database_path = workspace.join("database.db");
 
+        if workspace.exists() {
+            fs::remove_dir_all(workspace)?;
+        }
+        fs::create_dir_all(workspace)?;
         fs::create_dir_all(&frames_dir)?;
         fs::create_dir_all(&sparse_dir)?;
         fs::create_dir_all(&text_dir)?;
@@ -260,6 +268,11 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
         scene: &mut Scene,
         frames: &[TrainingFrame],
     ) -> Result<(), VideoInitError> {
+        println!(
+            "training on {} registered frames for {} epochs",
+            frames.len(),
+            self.options.train_epochs,
+        );
         for epoch_index in 0..self.options.train_epochs {
             let mut epoch_total_loss = 0.0_f64;
             let mut epoch_rgb_loss = 0.0_f64;
@@ -394,6 +407,19 @@ fn load_training_frames(
 ) -> Result<Vec<TrainingFrame>, VideoInitError> {
     let cameras = load_cameras(&text_dir.join("cameras.txt"))?;
     let images = load_registered_images(&text_dir.join("images.txt"))?;
+    let extracted_frames = count_extracted_frames(frames_dir)?;
+
+    println!(
+        "colmap registered {} / {} extracted frames",
+        images.len(),
+        extracted_frames,
+    );
+    if images.len() < 3 {
+        return Err(VideoInitError::TooFewRegisteredFrames {
+            extracted_frames,
+            registered_frames: images.len(),
+        });
+    }
 
     images
         .into_iter()
@@ -410,6 +436,13 @@ fn load_training_frames(
             })
         })
         .collect()
+}
+
+fn count_extracted_frames(frames_dir: &Path) -> Result<usize, VideoInitError> {
+    Ok(fs::read_dir(frames_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("png"))
+        .count())
 }
 
 fn load_target_image(path: &Path) -> Result<ImageData, VideoInitError> {
@@ -699,9 +732,11 @@ mod tests {
                     .expect("frame output should have parent")
                     .to_path_buf();
                 fs::create_dir_all(&frames_dir)?;
-                RgbImage::from_raw(2, 2, vec![255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0])
-                    .expect("image should construct")
-                    .save(frames_dir.join("frame_00001.png"))?;
+                for frame_name in ["frame_00001.png", "frame_00005.png", "frame_00009.png"] {
+                    RgbImage::from_raw(2, 2, vec![255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0])
+                        .expect("image should construct")
+                        .save(frames_dir.join(frame_name))?;
+                }
             }
 
             if program == "colmap" && args.first().map(String::as_str) == Some("mapper") {
@@ -722,7 +757,7 @@ mod tests {
                 )?;
                 fs::write(
                     text_dir.join("images.txt"),
-                    "# IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME\n1 1 0 0 0 0 0 0 1 frame_00001.png\n\n",
+                    "# IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME\n1 1 0 0 0 0 0 0 1 frame_00001.png\n\n2 1 0 0 0 0 0 -0.1 1 frame_00005.png\n\n3 1 0 0 0 0 0 -0.2 1 frame_00009.png\n\n",
                 )?;
             }
 
@@ -816,8 +851,41 @@ mod tests {
             .initialize_and_train_from_video(&video_path, &temp_dir.join("workspace"))
             .expect("video training should succeed");
 
-        assert_eq!(scene.centroid_x.step, 1);
-        assert_eq!(scene.centroid_r.step, 1);
+        assert_eq!(scene.centroid_x.step, 3);
+        assert_eq!(scene.centroid_r.step, 3);
+
+        fs::remove_dir_all(temp_dir).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn load_training_frames_rejects_when_colmap_registers_too_few_frames() {
+        let temp_dir = make_temp_dir("too-few-frames");
+        let frames_dir = temp_dir.join("frames");
+        fs::create_dir_all(&frames_dir).expect("frames dir should create");
+        RgbImage::from_raw(2, 2, vec![255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0])
+            .expect("image should construct")
+            .save(frames_dir.join("frame_00001.png"))
+            .expect("frame should save");
+        fs::write(
+            temp_dir.join("cameras.txt"),
+            "# CAMERA_ID MODEL WIDTH HEIGHT PARAMS[]\n1 PINHOLE 2 2 2.0 2.0 1.0 1.0\n",
+        )
+        .expect("camera file should write");
+        fs::write(
+            temp_dir.join("images.txt"),
+            "# IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME\n1 1 0 0 0 0 0 0 1 frame_00001.png\n\n",
+        )
+        .expect("images file should write");
+
+        let result = super::load_training_frames(&temp_dir, &frames_dir);
+
+        assert!(matches!(
+            result,
+            Err(VideoInitError::TooFewRegisteredFrames {
+                extracted_frames: 1,
+                registered_frames: 1,
+            })
+        ));
 
         fs::remove_dir_all(temp_dir).expect("temp dir should clean up");
     }
