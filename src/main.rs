@@ -6,7 +6,7 @@ pub mod viewer;
 
 use crate::renderer::{OrthographicRenderer, Renderer};
 use crate::scene::Scene;
-use crate::video::ColmapVideoInitializer;
+use crate::video::{ColmapVideoInitializer, VideoInitOptions};
 use crate::viewer::run_scene_viewer;
 use image::RgbImage;
 use std::env;
@@ -92,8 +92,8 @@ fn run_video_initialization(args: &[String]) {
 }
 
 fn run_explicit_video_training(args: &[String]) {
-    if args.len() != 4 && args.len() != 5 {
-        eprintln!("usage: radiant-foam train-video <video-path> <scene-json> [workspace-dir]");
+    if args.len() < 4 || args.len() > 6 {
+        eprintln!("usage: radiant-foam train-video <video-path> <scene-json> [workspace-dir] [fps]");
         std::process::exit(1);
     }
 
@@ -103,8 +103,20 @@ fn run_explicit_video_training(args: &[String]) {
         .get(4)
         .map(PathBuf::from)
         .unwrap_or_else(|| scene_path.with_extension("colmap"));
+    let fps = args
+        .get(5)
+        .or_else(|| {
+            args.get(4)
+                .filter(|value| value.parse::<f64>().is_ok())
+        })
+        .and_then(|value| value.parse::<f64>().ok());
 
-    if let Err(error) = run_video_training_impl(video_path, scene_path, &workspace) {
+    let options = fps.map(|fps| VideoInitOptions {
+        fps,
+        ..VideoInitOptions::default()
+    });
+
+    if let Err(error) = run_video_training_impl(video_path, scene_path, &workspace, options) {
         eprintln!("{error}");
         std::process::exit(1);
     }
@@ -114,7 +126,7 @@ fn run_video_training(video_path: &Path) -> Result<(), String> {
     let scene_path = video_path.with_extension("scene.json");
     let workspace = video_path.with_extension("radiant-foam");
 
-    run_video_training_impl(video_path, &scene_path, &workspace)
+    run_video_training_impl(video_path, &scene_path, &workspace, None)
 }
 
 fn run_video_initialization_impl(
@@ -136,8 +148,12 @@ fn run_video_training_impl(
     video_path: &Path,
     scene_path: &Path,
     workspace: &Path,
+    options: Option<VideoInitOptions>,
 ) -> Result<(), String> {
-    let mut initializer = ColmapVideoInitializer::default();
+    let mut initializer = ColmapVideoInitializer::new(
+        crate::video::SystemCommandRunner,
+        options.unwrap_or_default(),
+    );
     let scene = initializer
         .initialize_and_train_from_video(video_path, workspace)
         .map_err(|error| format!("video training failed: {error:?}"))?;

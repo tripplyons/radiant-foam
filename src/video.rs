@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const DEFAULT_FPS: f64 = 4.0;
+const DEFAULT_FPS: f64 = 8.0;
 const DEFAULT_LOG_DENSITY: f64 = -3.0;
 const DEFAULT_DISTORTION_LAMBDA: f64 = 1e-2;
 const DEFAULT_LEARNING_RATE: f64 = 1e-3;
