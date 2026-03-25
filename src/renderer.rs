@@ -103,6 +103,8 @@ struct RayTraceScratch {
     distortion_weight_grads: Vec<f64>,
     distortion_boundary_grads: Vec<f64>,
     finite_indices: Vec<usize>,
+    prefix_weights: Vec<f64>,
+    prefix_weighted_midpoints: Vec<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -673,39 +675,56 @@ fn distortion_loss_and_gradients(scratch: &mut RayTraceScratch) -> f64 {
         return 0.0;
     }
 
-    let mut loss = 0.0_f64;
+    scratch.prefix_weights.clear();
+    scratch
+        .prefix_weights
+        .resize(scratch.finite_indices.len() + 1, 0.0);
+    scratch.prefix_weighted_midpoints.clear();
+    scratch
+        .prefix_weighted_midpoints
+        .resize(scratch.finite_indices.len() + 1, 0.0);
 
-    for &index in &scratch.finite_indices {
-        let segment = &scratch.segments[index];
+    for (ordered_index, &segment_index) in scratch.finite_indices.iter().enumerate() {
+        let segment = &scratch.segments[segment_index];
         let delta = segment.segment_length.expect("finite segment should have length");
         let weight = segment.remaining_before * segment.alpha;
         let midpoint = segment.start_t + 0.5 * delta;
 
+        scratch.prefix_weights[ordered_index + 1] = scratch.prefix_weights[ordered_index] + weight;
+        scratch.prefix_weighted_midpoints[ordered_index + 1] =
+            scratch.prefix_weighted_midpoints[ordered_index] + weight * midpoint;
+    }
+
+    let total_weight = *scratch.prefix_weights.last().expect("prefix weights should exist");
+    let total_weighted_midpoint = *scratch
+        .prefix_weighted_midpoints
+        .last()
+        .expect("prefix weighted midpoints should exist");
+    let mut loss = 0.0_f64;
+
+    for (ordered_index, &index) in scratch.finite_indices.iter().enumerate() {
+        let segment = &scratch.segments[index];
+        let delta = segment.segment_length.expect("finite segment should have length");
+        let weight = segment.remaining_before * segment.alpha;
+        let midpoint = segment.start_t + 0.5 * delta;
+        let prefix_weight = scratch.prefix_weights[ordered_index];
+        let prefix_weighted_midpoint = scratch.prefix_weighted_midpoints[ordered_index];
+        let suffix_weight = total_weight - scratch.prefix_weights[ordered_index + 1];
+        let suffix_weighted_midpoint =
+            total_weighted_midpoint - scratch.prefix_weighted_midpoints[ordered_index + 1];
+
         loss += (weight * weight * delta) / 3.0;
         scratch.distortion_weight_grads[index] += (2.0 / 3.0) * weight * delta;
+        loss += 2.0 * weight * (midpoint * prefix_weight - prefix_weighted_midpoint);
+        scratch.distortion_weight_grads[index] +=
+            2.0 * ((midpoint * prefix_weight - prefix_weighted_midpoint)
+                + (suffix_weighted_midpoint - midpoint * suffix_weight));
 
-        for &other_index in &scratch.finite_indices {
-            if index == other_index {
-                continue;
-            }
-            let other_segment = &scratch.segments[other_index];
-            let other_delta = other_segment
-                .segment_length
-                .expect("finite segment should have length");
-            let other_weight = other_segment.remaining_before * other_segment.alpha;
-            let other_midpoint = other_segment.start_t + 0.5 * other_delta;
-            let distance = (midpoint - other_midpoint).abs();
-            let sign = (midpoint - other_midpoint).signum();
-
-            loss += weight * other_weight * distance;
-            scratch.distortion_weight_grads[index] += other_weight * distance;
-
-            let midpoint_grad = weight * other_weight * sign;
-            if index > 0 {
-                scratch.distortion_boundary_grads[index - 1] += 0.5 * midpoint_grad;
-            }
-            scratch.distortion_boundary_grads[index] += 0.5 * midpoint_grad;
+        let midpoint_grad = 2.0 * weight * (prefix_weight - suffix_weight);
+        if index > 0 {
+            scratch.distortion_boundary_grads[index - 1] += 0.5 * midpoint_grad;
         }
+        scratch.distortion_boundary_grads[index] += 0.5 * midpoint_grad;
 
         let delta_grad = (weight * weight) / 3.0;
         if index > 0 {
