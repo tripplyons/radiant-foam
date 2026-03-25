@@ -2,8 +2,8 @@ use crate::parameter::{Parameter, ParameterError};
 use rand::RngExt;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::f64::consts::TAU;
+use std::fs;
 use std::path::Path;
 
 const SPLIT_FALLBACK_OFFSET_MAGNITUDE: f64 = 1e-3;
@@ -92,8 +92,8 @@ impl Scene {
     }
 
     pub fn save_to_json(&self, path: &Path) -> Result<(), SceneError> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|_| SceneError::SerializationFailed)?;
+        let json =
+            serde_json::to_string_pretty(self).map_err(|_| SceneError::SerializationFailed)?;
         fs::write(path, json).map_err(SceneError::Io)?;
         Ok(())
     }
@@ -293,6 +293,7 @@ impl Scene {
         }
     }
 
+    #[cfg(test)]
     fn are_neighbors(&self, i: usize, j: usize) -> bool {
         let points = self.points();
         are_neighbors_for_points(&points, i, j)
@@ -351,7 +352,12 @@ fn are_neighbors_for_points(points: &[[f64; 3]], i: usize, j: usize) -> bool {
     false
 }
 
-fn is_shared_closest_point_for_points(points: &[[f64; 3]], q: [f64; 3], i: usize, j: usize) -> bool {
+fn is_shared_closest_point_for_points(
+    points: &[[f64; 3]],
+    q: [f64; 3],
+    i: usize,
+    j: usize,
+) -> bool {
     let dij = dist_sq(q, points[i]);
     let eps = 1e-5 * (1.0 + dij.abs());
 
@@ -847,24 +853,30 @@ mod tests {
         scene.save_to_json(&path).expect("scene should save");
         let loaded = Scene::load_from_json(&path).expect("scene should load");
 
-        assert!(scene
-            .centroid_x
-            .values
-            .iter()
-            .zip(&loaded.centroid_x.values)
-            .all(|(lhs, rhs)| (lhs - rhs).abs() < 1e-12));
-        assert!(scene
-            .centroid_y
-            .values
-            .iter()
-            .zip(&loaded.centroid_y.values)
-            .all(|(lhs, rhs)| (lhs - rhs).abs() < 1e-12));
-        assert!(scene
-            .centroid_z
-            .values
-            .iter()
-            .zip(&loaded.centroid_z.values)
-            .all(|(lhs, rhs)| (lhs - rhs).abs() < 1e-12));
+        assert!(
+            scene
+                .centroid_x
+                .values
+                .iter()
+                .zip(&loaded.centroid_x.values)
+                .all(|(lhs, rhs)| (lhs - rhs).abs() < 1e-12)
+        );
+        assert!(
+            scene
+                .centroid_y
+                .values
+                .iter()
+                .zip(&loaded.centroid_y.values)
+                .all(|(lhs, rhs)| (lhs - rhs).abs() < 1e-12)
+        );
+        assert!(
+            scene
+                .centroid_z
+                .values
+                .iter()
+                .zip(&loaded.centroid_z.values)
+                .all(|(lhs, rhs)| (lhs - rhs).abs() < 1e-12)
+        );
         assert_eq!(scene.centroid_neighbors, loaded.centroid_neighbors);
 
         fs::remove_file(path).expect("json should clean up");

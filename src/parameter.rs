@@ -58,7 +58,7 @@ impl Parameter {
         self.step = self.step.saturating_add(1);
         let t = self.step as f64;
         let bias_correction1 = 1.0 - self.beta1.powf(t);
-       let bias_correction2 = 1.0 - self.beta2.powf(t);
+        let bias_correction2 = 1.0 - self.beta2.powf(t);
         let mut changed = false;
 
         for (i, &g) in gradients.iter().enumerate() {

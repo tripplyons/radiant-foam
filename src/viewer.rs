@@ -14,6 +14,7 @@ const PITCH_LIMIT: f64 = 1.5533430342749532;
 pub fn run_scene_viewer(scene_path: &Path) -> Result<(), String> {
     let scene = Scene::load_from_json(scene_path)
         .map_err(|error| format!("failed to load scene {}: {error:?}", scene_path.display()))?;
+    println!("scene has {} centroids", scene.centroid_x.len());
     let mut viewer = Viewer::new(scene)?;
     viewer.run()
 }
@@ -84,8 +85,7 @@ impl Viewer {
             ),
             vertical: axis(
                 self.window.is_key_down(Key::Space),
-                self.window.is_key_down(Key::LeftShift)
-                    || self.window.is_key_down(Key::RightShift),
+                self.window.is_key_down(Key::LeftShift) || self.window.is_key_down(Key::RightShift),
             ),
         };
         self.controller.step(movement, delta_seconds);
@@ -97,7 +97,11 @@ impl Viewer {
             .render(&self.scene)
             .map_err(|error| format!("failed to render scene: {error:?}"))?;
 
-        for (dst, rgb) in self.frame_buffer.iter_mut().zip(image.pixels.chunks_exact(3)) {
+        for (dst, rgb) in self
+            .frame_buffer
+            .iter_mut()
+            .zip(image.pixels.chunks_exact(3))
+        {
             *dst = ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32;
         }
 
@@ -145,9 +149,11 @@ impl CameraController {
         let flat_right = [flat_forward[2], 0.0, -flat_forward[0]];
         let speed = MOVE_SPEED * delta_seconds;
 
-        self.position[0] += speed * (movement.forward * flat_forward[0] + movement.strafe * flat_right[0]);
+        self.position[0] +=
+            speed * (movement.forward * flat_forward[0] + movement.strafe * flat_right[0]);
         self.position[1] += speed * movement.vertical;
-        self.position[2] += speed * (movement.forward * flat_forward[2] + movement.strafe * flat_right[2]);
+        self.position[2] +=
+            speed * (movement.forward * flat_forward[2] + movement.strafe * flat_right[2]);
     }
 
     fn turn(&mut self, delta_x: f64, delta_y: f64) {

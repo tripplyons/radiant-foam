@@ -54,6 +54,7 @@ fn main() {
     scene
         .compute_neighbors()
         .expect("failed to compute centroid neighbors");
+    println!("scene has {} centroids", scene.centroid_x.len());
 
     let mut renderer = OrthographicRenderer::new(512, 512);
     renderer.world_x_min = -2.0;
@@ -93,7 +94,9 @@ fn run_video_initialization(args: &[String]) {
 
 fn run_explicit_video_training(args: &[String]) {
     if args.len() < 4 || args.len() > 6 {
-        eprintln!("usage: radiant-foam train-video <video-path> <scene-json> [workspace-dir] [fps]");
+        eprintln!(
+            "usage: radiant-foam train-video <video-path> <scene-json> [workspace-dir] [fps]"
+        );
         std::process::exit(1);
     }
 
@@ -105,10 +108,7 @@ fn run_explicit_video_training(args: &[String]) {
         .unwrap_or_else(|| scene_path.with_extension("colmap"));
     let fps = args
         .get(5)
-        .or_else(|| {
-            args.get(4)
-                .filter(|value| value.parse::<f64>().is_ok())
-        })
+        .or_else(|| args.get(4).filter(|value| value.parse::<f64>().is_ok()))
         .and_then(|value| value.parse::<f64>().ok());
 
     let options = fps.map(|fps| VideoInitOptions {
@@ -138,6 +138,7 @@ fn run_video_initialization_impl(
     let scene = initializer
         .initialize_scene_from_video(video_path, workspace)
         .map_err(|error| format!("video initialization failed: {error:?}"))?;
+    println!("scene has {} centroids", scene.centroid_x.len());
     scene
         .save_to_json(scene_path)
         .map_err(|error| format!("failed to save scene {}: {error:?}", scene_path.display()))?;
@@ -157,6 +158,7 @@ fn run_video_training_impl(
     let scene = initializer
         .initialize_and_train_from_video(video_path, workspace)
         .map_err(|error| format!("video training failed: {error:?}"))?;
+    println!("scene has {} centroids", scene.centroid_x.len());
     scene
         .save_to_json(scene_path)
         .map_err(|error| format!("failed to save scene {}: {error:?}", scene_path.display()))?;

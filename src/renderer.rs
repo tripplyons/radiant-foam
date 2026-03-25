@@ -4,6 +4,9 @@ use rayon::prelude::*;
 
 const RAY_ADVANCE_EPSILON: f64 = 1e-9;
 const TRANSMITTANCE_EPSILON: f64 = 1e-6;
+const TREE_BOUNDS_TIGHTEN_INTERVAL: u64 = 8;
+const TREE_REBUILD_INTERVAL: u64 = 16;
+const TREE_SIGNIFICANT_BOUNDS_SHIFT_RATIO: f64 = 0.25;
 
 #[derive(Clone, Debug)]
 pub struct ImageData {
@@ -139,6 +142,7 @@ struct CentroidTree {
     indices: Vec<usize>,
     nodes: Vec<CentroidTreeNode>,
     root: usize,
+    refresh_generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +153,9 @@ struct CentroidTreeNode {
     right: Option<usize>,
     bounds_min: [f64; 3],
     bounds_max: [f64; 3],
+    last_bounds_update_generation: u64,
+    last_rebuild_generation: u64,
+    needs_rebuild: bool,
 }
 
 #[derive(Default)]
@@ -204,7 +211,11 @@ impl OrthographicRenderPlan {
 
         Ok(Self {
             direction,
-            x_positions: sample_positions(renderer.width, renderer.world_x_min, renderer.world_x_max),
+            x_positions: sample_positions(
+                renderer.width,
+                renderer.world_x_min,
+                renderer.world_x_max,
+            ),
             y_positions: sample_positions_flipped(
                 renderer.height,
                 renderer.world_y_min,
@@ -277,8 +288,21 @@ impl CentroidTree {
     fn build(scene: &Scene) -> Self {
         let mut indices = (0..scene.centroid_x.len()).collect::<Vec<_>>();
         let mut nodes = Vec::new();
-        let root = Self::build_node(scene, &mut indices, &mut nodes, 0, scene.centroid_x.len());
-        Self { indices, nodes, root }
+        let refresh_generation = 0;
+        let root = Self::build_node(
+            scene,
+            &mut indices,
+            &mut nodes,
+            0,
+            scene.centroid_x.len(),
+            refresh_generation,
+        );
+        Self {
+            indices,
+            nodes,
+            root,
+            refresh_generation,
+        }
     }
 
     fn build_node(
@@ -287,6 +311,7 @@ impl CentroidTree {
         nodes: &mut Vec<CentroidTreeNode>,
         start: usize,
         end: usize,
+        refresh_generation: u64,
     ) -> usize {
         let (bounds_min, bounds_max) = bounds_for_indices(scene, &indices[start..end]);
         let node_index = nodes.len();
@@ -297,6 +322,9 @@ impl CentroidTree {
             right: None,
             bounds_min,
             bounds_max,
+            last_bounds_update_generation: refresh_generation,
+            last_rebuild_generation: refresh_generation,
+            needs_rebuild: false,
         });
 
         if end - start > TRAINING_TREE_LEAF_SIZE {
@@ -307,13 +335,100 @@ impl CentroidTree {
                     .partial_cmp(&point(scene, *right)[axis])
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            let left = Self::build_node(scene, indices, nodes, start, mid);
-            let right = Self::build_node(scene, indices, nodes, mid, end);
+            let left = Self::build_node(scene, indices, nodes, start, mid, refresh_generation);
+            let right = Self::build_node(scene, indices, nodes, mid, end, refresh_generation);
             nodes[node_index].left = Some(left);
             nodes[node_index].right = Some(right);
         }
 
         node_index
+    }
+
+    fn refresh(&mut self, scene: &Scene) {
+        self.refresh_generation = self.refresh_generation.saturating_add(1);
+        self.root = self.refresh_node(scene, self.root);
+    }
+
+    fn refresh_node(&mut self, scene: &Scene, node_index: usize) -> usize {
+        let node = self.nodes[node_index].clone();
+
+        if let (Some(left), Some(right)) = (node.left, node.right) {
+            let left = self.refresh_node(scene, left);
+            let right = self.refresh_node(scene, right);
+            let exact_min = [
+                self.nodes[left].bounds_min[0].min(self.nodes[right].bounds_min[0]),
+                self.nodes[left].bounds_min[1].min(self.nodes[right].bounds_min[1]),
+                self.nodes[left].bounds_min[2].min(self.nodes[right].bounds_min[2]),
+            ];
+            let exact_max = [
+                self.nodes[left].bounds_max[0].max(self.nodes[right].bounds_max[0]),
+                self.nodes[left].bounds_max[1].max(self.nodes[right].bounds_max[1]),
+                self.nodes[left].bounds_max[2].max(self.nodes[right].bounds_max[2]),
+            ];
+
+            let significant_change = bounds_changed_significantly(
+                node.bounds_min,
+                node.bounds_max,
+                exact_min,
+                exact_max,
+            );
+            let needs_rebuild = node.needs_rebuild || significant_change;
+
+            if self.should_rebuild_subtree(&node, needs_rebuild) {
+                return self.rebuild_subtree(scene, node.start, node.end);
+            }
+
+            let (bounds_min, bounds_max, bounds_generation) = refreshed_bounds(
+                node.bounds_min,
+                node.bounds_max,
+                exact_min,
+                exact_max,
+                node.last_bounds_update_generation,
+                self.refresh_generation,
+            );
+            self.nodes[node_index].left = Some(left);
+            self.nodes[node_index].right = Some(right);
+            self.nodes[node_index].bounds_min = bounds_min;
+            self.nodes[node_index].bounds_max = bounds_max;
+            self.nodes[node_index].last_bounds_update_generation = bounds_generation;
+            self.nodes[node_index].needs_rebuild = needs_rebuild;
+            node_index
+        } else {
+            let (exact_min, exact_max) =
+                bounds_for_indices(scene, &self.indices[node.start..node.end]);
+            let (bounds_min, bounds_max, bounds_generation) = refreshed_bounds(
+                node.bounds_min,
+                node.bounds_max,
+                exact_min,
+                exact_max,
+                node.last_bounds_update_generation,
+                self.refresh_generation,
+            );
+            self.nodes[node_index].bounds_min = bounds_min;
+            self.nodes[node_index].bounds_max = bounds_max;
+            self.nodes[node_index].last_bounds_update_generation = bounds_generation;
+            node_index
+        }
+    }
+
+    fn should_rebuild_subtree(&self, node: &CentroidTreeNode, needs_rebuild: bool) -> bool {
+        node.end - node.start > TRAINING_TREE_LEAF_SIZE
+            && needs_rebuild
+            && self
+                .refresh_generation
+                .saturating_sub(node.last_rebuild_generation)
+                >= TREE_REBUILD_INTERVAL
+    }
+
+    fn rebuild_subtree(&mut self, scene: &Scene, start: usize, end: usize) -> usize {
+        Self::build_node(
+            scene,
+            &mut self.indices,
+            &mut self.nodes,
+            start,
+            end,
+            self.refresh_generation,
+        )
     }
 
     fn closest_centroid_at_point(&self, scene: &Scene, query: [f64; 3]) -> usize {
@@ -337,10 +452,16 @@ impl CentroidTree {
         }
 
         if let (Some(left), Some(right)) = (node.left, node.right) {
-            let left_distance =
-                distance_sq_to_bounds(query, self.nodes[left].bounds_min, self.nodes[left].bounds_max);
-            let right_distance =
-                distance_sq_to_bounds(query, self.nodes[right].bounds_min, self.nodes[right].bounds_max);
+            let left_distance = distance_sq_to_bounds(
+                query,
+                self.nodes[left].bounds_min,
+                self.nodes[left].bounds_max,
+            );
+            let right_distance = distance_sq_to_bounds(
+                query,
+                self.nodes[right].bounds_min,
+                self.nodes[right].bounds_max,
+            );
             let (first, second) = if left_distance <= right_distance {
                 (left, right)
             } else {
@@ -477,7 +598,20 @@ impl CentroidTree {
 
 impl TrainingTopologyCache {
     fn tree<'a>(&'a mut self, scene: &Scene) -> &'a CentroidTree {
-        self.tree.get_or_insert_with(|| CentroidTree::build(scene))
+        let needs_rebuild = self
+            .tree
+            .as_ref()
+            .is_none_or(|tree| tree.indices.len() != scene.centroid_x.len());
+
+        if needs_rebuild {
+            self.tree = Some(CentroidTree::build(scene));
+        } else if let Some(tree) = self.tree.as_mut() {
+            tree.refresh(scene);
+        }
+
+        self.tree
+            .as_ref()
+            .expect("tree should exist after cache refresh")
     }
 
     fn invalidate_positions(&mut self) {
@@ -550,6 +684,7 @@ impl OrthographicRenderer {
         Ok(pixels)
     }
 
+    #[cfg(test)]
     fn mse_loss(&self, scene: &Scene, target: &ImageData) -> Result<f64, RendererError> {
         self.validate_target(target)?;
         let rendered = self.render_linear(scene)?;
@@ -648,7 +783,8 @@ impl OrthographicRenderer {
                 },
             );
 
-        let rgb_loss = accumulator.rgb_loss / (self.width as usize * self.height as usize * 3) as f64;
+        let rgb_loss =
+            accumulator.rgb_loss / (self.width as usize * self.height as usize * 3) as f64;
         let distortion_loss =
             accumulator.distortion_loss / (self.width as usize * self.height as usize) as f64;
 
@@ -751,8 +887,8 @@ impl PerspectiveRenderer {
 
         let normalizer =
             2.0 / ((self.camera.width as usize * self.camera.height as usize * 3) as f64);
-        let distortion_normalizer =
-            self.distortion_lambda / (self.camera.width as usize * self.camera.height as usize) as f64;
+        let distortion_normalizer = self.distortion_lambda
+            / (self.camera.width as usize * self.camera.height as usize) as f64;
         let target_scale = 1.0 / 255.0;
         let accumulator = (0..self.camera.height as usize)
             .into_par_iter()
@@ -803,10 +939,10 @@ impl PerspectiveRenderer {
                 },
             );
 
-        let rgb_loss =
-            accumulator.rgb_loss / (self.camera.width as usize * self.camera.height as usize * 3) as f64;
-        let distortion_loss =
-            accumulator.distortion_loss / (self.camera.width as usize * self.camera.height as usize) as f64;
+        let rgb_loss = accumulator.rgb_loss
+            / (self.camera.width as usize * self.camera.height as usize * 3) as f64;
+        let distortion_loss = accumulator.distortion_loss
+            / (self.camera.width as usize * self.camera.height as usize) as f64;
 
         Ok(TrainStepResult {
             loss: rgb_loss + self.distortion_lambda * distortion_loss,
@@ -882,7 +1018,8 @@ impl OrthographicRenderer {
         target: &ImageData,
     ) -> Result<TrainStepResult, RendererError> {
         let mut cache = TrainingTopologyCache::default();
-        let result = self.train_step_with_cache_without_neighbor_refresh(scene, target, &mut cache)?;
+        let result =
+            self.train_step_with_cache_without_neighbor_refresh(scene, target, &mut cache)?;
         Ok(result)
     }
 
@@ -907,7 +1044,8 @@ impl PerspectiveRenderer {
         target: &ImageData,
     ) -> Result<TrainStepResult, RendererError> {
         let mut cache = TrainingTopologyCache::default();
-        let result = self.train_step_with_cache_without_neighbor_refresh(scene, target, &mut cache)?;
+        let result =
+            self.train_step_with_cache_without_neighbor_refresh(scene, target, &mut cache)?;
         Ok(result)
     }
 
@@ -1026,7 +1164,9 @@ fn distortion_loss_and_gradients(scratch: &mut RayTraceScratch) -> f64 {
 
     for (ordered_index, &segment_index) in scratch.finite_indices.iter().enumerate() {
         let segment = &scratch.segments[segment_index];
-        let delta = segment.segment_length.expect("finite segment should have length");
+        let delta = segment
+            .segment_length
+            .expect("finite segment should have length");
         let weight = segment.remaining_before * segment.alpha;
         let midpoint = segment.start_t + 0.5 * delta;
 
@@ -1035,7 +1175,10 @@ fn distortion_loss_and_gradients(scratch: &mut RayTraceScratch) -> f64 {
             scratch.prefix_weighted_midpoints[ordered_index] + weight * midpoint;
     }
 
-    let total_weight = *scratch.prefix_weights.last().expect("prefix weights should exist");
+    let total_weight = *scratch
+        .prefix_weights
+        .last()
+        .expect("prefix weights should exist");
     let total_weighted_midpoint = *scratch
         .prefix_weighted_midpoints
         .last()
@@ -1044,7 +1187,9 @@ fn distortion_loss_and_gradients(scratch: &mut RayTraceScratch) -> f64 {
 
     for (ordered_index, &index) in scratch.finite_indices.iter().enumerate() {
         let segment = &scratch.segments[index];
-        let delta = segment.segment_length.expect("finite segment should have length");
+        let delta = segment
+            .segment_length
+            .expect("finite segment should have length");
         let weight = segment.remaining_before * segment.alpha;
         let midpoint = segment.start_t + 0.5 * delta;
         let prefix_weight = scratch.prefix_weights[ordered_index];
@@ -1056,8 +1201,8 @@ fn distortion_loss_and_gradients(scratch: &mut RayTraceScratch) -> f64 {
         loss += (weight * weight * delta) / 3.0;
         scratch.distortion_weight_grads[index] += (2.0 / 3.0) * weight * delta;
         loss += 2.0 * weight * (midpoint * prefix_weight - prefix_weighted_midpoint);
-        scratch.distortion_weight_grads[index] +=
-            2.0 * ((midpoint * prefix_weight - prefix_weighted_midpoint)
+        scratch.distortion_weight_grads[index] += 2.0
+            * ((midpoint * prefix_weight - prefix_weighted_midpoint)
                 + (suffix_weighted_midpoint - midpoint * suffix_weight));
 
         let midpoint_grad = 2.0 * weight * (prefix_weight - suffix_weight);
@@ -1129,8 +1274,15 @@ fn trace_ray(
     scratch.segments.clear();
 
     while remaining > TRANSMITTANCE_EPSILON {
-        let next =
-            next_centroid_along_ray(scene, current, ray_origin, direction, t0, traversal_mode, training_tree);
+        let next = next_centroid_along_ray(
+            scene,
+            current,
+            ray_origin,
+            direction,
+            t0,
+            traversal_mode,
+            training_tree,
+        );
         let centroid_color = centroid_color(scene, current);
         let log_density = scene.centroid_opacity.values[current];
         let sigma = log_density.exp();
@@ -1179,9 +1331,7 @@ fn accumulate_trace_gradients(
 ) -> f64 {
     let mut grad_remaining = 0.0_f64;
     scratch.boundary_grads.clear();
-    scratch
-        .boundary_grads
-        .resize(scratch.segments.len(), 0.0);
+    scratch.boundary_grads.resize(scratch.segments.len(), 0.0);
     let distortion_loss = distortion_loss_and_gradients(scratch);
 
     for segment_index in (0..scratch.segments.len()).rev() {
@@ -1273,11 +1423,7 @@ fn accumulate_boundary_time_gradient(
         -2.0 * direction[1],
         -2.0 * direction[2],
     ];
-    let denominator_grad_j = [
-        2.0 * direction[0],
-        2.0 * direction[1],
-        2.0 * direction[2],
-    ];
+    let denominator_grad_j = [2.0 * direction[0], 2.0 * direction[1], 2.0 * direction[2]];
 
     let time_grad_i = quotient_gradient(
         numerator,
@@ -1348,6 +1494,84 @@ fn bounds_for_indices(scene: &Scene, indices: &[usize]) -> ([f64; 3], [f64; 3]) 
     (bounds_min, bounds_max)
 }
 
+fn refreshed_bounds(
+    current_min: [f64; 3],
+    current_max: [f64; 3],
+    exact_min: [f64; 3],
+    exact_max: [f64; 3],
+    last_update_generation: u64,
+    refresh_generation: u64,
+) -> ([f64; 3], [f64; 3], u64) {
+    if !bounds_contain(current_min, current_max, exact_min, exact_max) {
+        let (expanded_min, expanded_max) =
+            union_bounds(current_min, current_max, exact_min, exact_max);
+        return (expanded_min, expanded_max, refresh_generation);
+    }
+
+    if refresh_generation.saturating_sub(last_update_generation) >= TREE_BOUNDS_TIGHTEN_INTERVAL
+        && bounds_changed_significantly(current_min, current_max, exact_min, exact_max)
+    {
+        return (exact_min, exact_max, refresh_generation);
+    }
+
+    (current_min, current_max, last_update_generation)
+}
+
+fn bounds_contain(
+    outer_min: [f64; 3],
+    outer_max: [f64; 3],
+    inner_min: [f64; 3],
+    inner_max: [f64; 3],
+) -> bool {
+    (0..3).all(|axis| outer_min[axis] <= inner_min[axis] && outer_max[axis] >= inner_max[axis])
+}
+
+fn union_bounds(
+    left_min: [f64; 3],
+    left_max: [f64; 3],
+    right_min: [f64; 3],
+    right_max: [f64; 3],
+) -> ([f64; 3], [f64; 3]) {
+    (
+        [
+            left_min[0].min(right_min[0]),
+            left_min[1].min(right_min[1]),
+            left_min[2].min(right_min[2]),
+        ],
+        [
+            left_max[0].max(right_max[0]),
+            left_max[1].max(right_max[1]),
+            left_max[2].max(right_max[2]),
+        ],
+    )
+}
+
+fn bounds_changed_significantly(
+    current_min: [f64; 3],
+    current_max: [f64; 3],
+    exact_min: [f64; 3],
+    exact_max: [f64; 3],
+) -> bool {
+    let current_extent = [
+        (current_max[0] - current_min[0]).abs(),
+        (current_max[1] - current_min[1]).abs(),
+        (current_max[2] - current_min[2]).abs(),
+    ];
+    let reference_scale = current_extent.into_iter().fold(0.0_f64, f64::max).max(1e-9);
+    let max_shift = [
+        (current_min[0] - exact_min[0]).abs(),
+        (current_min[1] - exact_min[1]).abs(),
+        (current_min[2] - exact_min[2]).abs(),
+        (current_max[0] - exact_max[0]).abs(),
+        (current_max[1] - exact_max[1]).abs(),
+        (current_max[2] - exact_max[2]).abs(),
+    ]
+    .into_iter()
+    .fold(0.0_f64, f64::max);
+
+    max_shift >= reference_scale * TREE_SIGNIFICANT_BOUNDS_SHIFT_RATIO
+}
+
 fn longest_axis(bounds_min: [f64; 3], bounds_max: [f64; 3]) -> usize {
     let extents = [
         bounds_max[0] - bounds_min[0],
@@ -1416,7 +1640,8 @@ fn crossing_time_lower_bound_for_bounds(
         return f64::INFINITY;
     }
 
-    let numerator_min = numerator_min_for_bounds(bounds_min, bounds_max, ray_origin) - origin_constant;
+    let numerator_min =
+        numerator_min_for_bounds(bounds_min, bounds_max, ray_origin) - origin_constant;
     if denominator_min <= 0.0 {
         if numerator_min < 0.0 {
             f64::NEG_INFINITY
@@ -1454,7 +1679,8 @@ fn numerator_min_for_bounds(
 ) -> f64 {
     let mut minimum = 0.0_f64;
     for axis in 0..3 {
-        minimum += quadratic_min_over_interval(bounds_min[axis], bounds_max[axis], ray_origin[axis]);
+        minimum +=
+            quadratic_min_over_interval(bounds_min[axis], bounds_max[axis], ray_origin[axis]);
     }
     minimum
 }
@@ -1498,13 +1724,9 @@ fn next_centroid_along_ray(
     training_tree: Option<&CentroidTree>,
 ) -> Option<(usize, f64)> {
     match traversal_mode {
-        TraversalMode::NeighborGraph => next_centroid_along_ray_neighbors(
-            scene,
-            current,
-            ray_origin,
-            direction,
-            t0,
-        ),
+        TraversalMode::NeighborGraph => {
+            next_centroid_along_ray_neighbors(scene, current, ray_origin, direction, t0)
+        }
         TraversalMode::AllCentroids => training_tree.map_or_else(
             || next_centroid_along_ray_all(scene, current, ray_origin, direction, t0),
             |tree| tree.next_centroid_along_ray(scene, current, ray_origin, direction, t0),
@@ -1617,14 +1839,18 @@ fn normalize(v: [f64; 3]) -> [f64; 3] {
 }
 
 fn clamp_derivative(value: f64) -> f64 {
-    if (0.0..1.0).contains(&value) { 1.0 } else { 0.0 }
+    if (0.0..1.0).contains(&value) {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         ImageData, OrthographicRenderer, PerspectiveCamera, PerspectiveRenderer, Renderer,
-        RendererError,
+        RendererError, TREE_REBUILD_INTERVAL, TrainingTopologyCache,
     };
     use crate::parameter::Parameter;
     use crate::scene::Scene;
@@ -1736,7 +1962,9 @@ mod tests {
         renderer.world_y_max = 0.0;
         renderer.ray_direction = [1.0, 0.0, 0.0];
         renderer.distortion_lambda = 0.5;
-        let target = renderer.render(&scene).expect("target render should succeed");
+        let target = renderer
+            .render(&scene)
+            .expect("target render should succeed");
 
         let result = renderer
             .train_step(&mut scene, &target)
@@ -1744,6 +1972,69 @@ mod tests {
 
         assert!(result.distortion_loss > 0.0);
         assert!(result.loss > result.rgb_loss);
+    }
+
+    #[test]
+    fn training_tree_reuses_structure_for_small_position_updates() {
+        let mut scene = structured_tree_test_scene();
+        let mut cache = TrainingTopologyCache::default();
+
+        let (root_before, node_count_before) = {
+            let tree = cache.tree(&scene);
+            (tree.root, tree.nodes.len())
+        };
+
+        scene.centroid_x.values[0] += 1e-4;
+        scene.centroid_y.values[0] -= 1e-4;
+
+        let (root_after, node_count_after) = {
+            let tree = cache.tree(&scene);
+            (tree.root, tree.nodes.len())
+        };
+
+        assert_eq!(root_before, root_after);
+        assert_eq!(node_count_before, node_count_after);
+    }
+
+    #[test]
+    fn training_tree_rebuilds_only_the_changed_branch_after_cooldown() {
+        let mut scene = structured_tree_test_scene();
+        let mut cache = TrainingTopologyCache::default();
+
+        let (root_before, left_before, right_before, node_count_before) = {
+            let tree = cache.tree(&scene);
+            let root = &tree.nodes[tree.root];
+            (
+                tree.root,
+                root.left.expect("root should have left child"),
+                root.right.expect("root should have right child"),
+                tree.nodes.len(),
+            )
+        };
+
+        for index in 0..16 {
+            scene.centroid_x.values[index] += 20.0;
+        }
+
+        for _ in 0..TREE_REBUILD_INTERVAL {
+            let _ = cache.tree(&scene);
+        }
+
+        let (root_after, left_after, right_after, node_count_after) = {
+            let tree = cache.tree(&scene);
+            let root = &tree.nodes[tree.root];
+            (
+                tree.root,
+                root.left.expect("root should have left child"),
+                root.right.expect("root should have right child"),
+                tree.nodes.len(),
+            )
+        };
+
+        assert_eq!(root_before, root_after);
+        assert_ne!(left_before, left_after);
+        assert_eq!(right_before, right_after);
+        assert!(node_count_after > node_count_before);
     }
 
     #[test]
@@ -1805,6 +2096,27 @@ mod tests {
             })
             .expect("b derivative should succeed"),
         );
+    }
+
+    fn structured_tree_test_scene() -> Scene {
+        let xs = (-100..=-85)
+            .chain(100..=115)
+            .map(|value| value as f64)
+            .collect::<Vec<_>>();
+        let zeros = vec![0.0; xs.len()];
+        let colors = vec![0.5; xs.len()];
+        let count = xs.len();
+
+        Scene {
+            centroid_x: Parameter::new(xs, 1e-3, 0.9, 0.999),
+            centroid_y: Parameter::new(zeros.clone(), 1e-3, 0.9, 0.999),
+            centroid_z: Parameter::new(zeros, 1e-3, 0.9, 0.999),
+            centroid_opacity: Parameter::new(vec![1.0; count], 1e-3, 0.9, 0.999),
+            centroid_r: Parameter::new(colors.clone(), 1e-3, 0.9, 0.999),
+            centroid_g: Parameter::new(colors.clone(), 1e-3, 0.9, 0.999),
+            centroid_b: Parameter::new(colors, 1e-3, 0.9, 0.999),
+            centroid_neighbors: vec![Vec::new(); count],
+        }
     }
 
     fn gradient_test_scene() -> Scene {
