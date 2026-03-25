@@ -2,10 +2,12 @@ pub mod parameter;
 pub mod renderer;
 pub mod scene;
 pub mod video;
+pub mod viewer;
 
 use crate::renderer::{OrthographicRenderer, Renderer};
 use crate::scene::Scene;
 use crate::video::ColmapVideoInitializer;
+use crate::viewer::run_scene_viewer;
 use image::RgbImage;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -13,7 +15,12 @@ use std::path::{Path, PathBuf};
 fn main() {
     let args = env::args().collect::<Vec<_>>();
     if args.len() == 2 {
-        run_video_training(Path::new(&args[1]));
+        let input_path = Path::new(&args[1]);
+        if input_path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            run_scene_viewer(input_path).expect("scene viewer should succeed");
+        } else {
+            run_video_training(input_path);
+        }
         return;
     }
 
@@ -23,6 +30,14 @@ fn main() {
     }
     if args.get(1).map(String::as_str) == Some("train-video") {
         run_explicit_video_training(&args);
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("view-scene") {
+        if args.len() != 3 {
+            eprintln!("usage: radiant-foam view-scene <scene-json>");
+            std::process::exit(1);
+        }
+        run_scene_viewer(Path::new(&args[2])).expect("scene viewer should succeed");
         return;
     }
 
