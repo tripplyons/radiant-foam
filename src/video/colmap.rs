@@ -12,6 +12,7 @@ use super::{
 pub(super) fn load_training_frames(
     text_dir: &Path,
     frames_dir: &Path,
+    options: &VideoInitOptions,
 ) -> Result<Vec<TrainingFrame>, VideoInitError> {
     let cameras = load_cameras(&text_dir.join("cameras.txt"))?;
     let images = load_registered_images(&text_dir.join("images.txt"))?;
@@ -30,10 +31,11 @@ pub(super) fn load_training_frames(
                 .get(&image.camera_id)
                 .ok_or(VideoInitError::MissingCameraId(image.camera_id))?;
             let image_path = frames_dir.join(&image.name);
-            let target = load_target_image(&image_path)?;
+            let target = load_target_image(&image_path, options.max_training_short_edge)?;
             Ok(TrainingFrame {
                 name: image.name,
                 camera: camera_model
+                    .scaled_to_image(target.width, target.height)
                     .to_perspective_camera(image.world_to_camera_rotation, image.translation),
                 target,
             })
@@ -41,9 +43,24 @@ pub(super) fn load_training_frames(
         .collect()
 }
 
+pub(super) fn load_scene_from_colmap_text_model_without_neighbors(
+    text_dir: &Path,
+    options: &VideoInitOptions,
+) -> Result<Scene, VideoInitError> {
+    load_scene_from_colmap_text_model_with_topology(text_dir, options, false)
+}
+
 pub fn load_scene_from_colmap_text_model(
     text_dir: &Path,
     options: &VideoInitOptions,
+) -> Result<Scene, VideoInitError> {
+    load_scene_from_colmap_text_model_with_topology(text_dir, options, true)
+}
+
+fn load_scene_from_colmap_text_model_with_topology(
+    text_dir: &Path,
+    options: &VideoInitOptions,
+    build_neighbors: bool,
 ) -> Result<Scene, VideoInitError> {
     let points_path = text_dir.join("points3D.txt");
     let contents = fs::read_to_string(&points_path)
@@ -101,7 +118,9 @@ pub fn load_scene_from_colmap_text_model(
         centroid_b: Parameter::new(b, DEFAULT_LEARNING_RATE, DEFAULT_BETA1, DEFAULT_BETA2),
         centroid_neighbors: vec![Vec::new(); count],
     };
-    scene.compute_neighbors()?;
+    if build_neighbors {
+        scene.compute_neighbors()?;
+    }
     Ok(scene)
 }
 
@@ -159,6 +178,20 @@ pub struct ColmapCameraModel {
 }
 
 impl ColmapCameraModel {
+    fn scaled_to_image(&self, width: u32, height: u32) -> Self {
+        let scale_x = width as f64 / self.width as f64;
+        let scale_y = height as f64 / self.height as f64;
+        Self {
+            id: self.id,
+            width,
+            height,
+            focal_x: self.focal_x * scale_x,
+            focal_y: self.focal_y * scale_y,
+            principal_x: self.principal_x * scale_x,
+            principal_y: self.principal_y * scale_y,
+        }
+    }
+
     fn to_perspective_camera(
         &self,
         world_to_camera_rotation: [[f64; 3]; 3],
@@ -196,14 +229,37 @@ fn count_extracted_frames(frames_dir: &Path) -> Result<usize, VideoInitError> {
         .count())
 }
 
-fn load_target_image(path: &Path) -> Result<ImageData, VideoInitError> {
+fn load_target_image(
+    path: &Path,
+    max_training_short_edge: Option<u32>,
+) -> Result<ImageData, VideoInitError> {
     if !path.exists() {
         return Err(VideoInitError::MissingFrameImage(path.to_path_buf()));
     }
-    let image = image::open(path)?.to_rgb8();
+    let mut image = image::open(path)?.to_rgb8();
+    let original_width = image.width();
+    let original_height = image.height();
+
+    if let Some(max_short_edge) = max_training_short_edge {
+        let short_edge = original_width.min(original_height);
+        if short_edge > max_short_edge {
+            let scale = max_short_edge as f64 / short_edge as f64;
+            let resized_width = ((original_width as f64 * scale).round() as u32).max(1);
+            let resized_height = ((original_height as f64 * scale).round() as u32).max(1);
+            image = image::imageops::resize(
+                &image,
+                resized_width,
+                resized_height,
+                image::imageops::FilterType::Triangle,
+            );
+        }
+    }
+
+    let width = image.width();
+    let height = image.height();
     Ok(ImageData {
-        width: image.width(),
-        height: image.height(),
+        width,
+        height,
         pixels: image.into_raw(),
     })
 }
@@ -364,4 +420,66 @@ fn mat3_mul_vec3(matrix: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
         matrix[1][0] * vector[0] + matrix[1][1] * vector[1] + matrix[1][2] * vector[2],
         matrix[2][0] * vector[0] + matrix[2][1] * vector[1] + matrix[2][2] * vector[2],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_training_frames;
+    use crate::video::VideoInitOptions;
+    use image::{Rgb, RgbImage};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn load_training_frames_caps_short_edge_and_scales_intrinsics() {
+        let temp_dir = make_temp_dir("training-frames-resize");
+        let text_dir = temp_dir.join("text");
+        let frames_dir = temp_dir.join("frames");
+        fs::create_dir_all(&text_dir).expect("text dir should create");
+        fs::create_dir_all(&frames_dir).expect("frames dir should create");
+
+        fs::write(
+            text_dir.join("cameras.txt"),
+            "# CAMERA_ID MODEL WIDTH HEIGHT PARAMS[]\n1 PINHOLE 16 8 12.0 10.0 8.0 4.0\n",
+        )
+        .expect("camera file should write");
+        fs::write(
+            text_dir.join("images.txt"),
+            "# IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME\n1 1 0 0 0 0 0 0 1 frame_00001.png\n\n",
+        )
+        .expect("image file should write");
+        RgbImage::from_pixel(16, 8, Rgb([255, 0, 0]))
+            .save(frames_dir.join("frame_00001.png"))
+            .expect("frame should save");
+
+        let options = VideoInitOptions {
+            max_training_short_edge: Some(4),
+            ..VideoInitOptions::default()
+        };
+        let frames =
+            load_training_frames(&text_dir, &frames_dir, &options).expect("frames should load");
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].target.width, 8);
+        assert_eq!(frames[0].target.height, 4);
+        assert_eq!(frames[0].camera.width, 8);
+        assert_eq!(frames[0].camera.height, 4);
+        assert!((frames[0].camera.focal_x - 6.0).abs() < 1e-9);
+        assert!((frames[0].camera.focal_y - 5.0).abs() < 1e-9);
+        assert!((frames[0].camera.principal_x - 4.0).abs() < 1e-9);
+        assert!((frames[0].camera.principal_y - 2.0).abs() < 1e-9);
+
+        fs::remove_dir_all(temp_dir).expect("temp dir should clean up");
+    }
+
+    fn make_temp_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should advance")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("radiant-foam-{label}-{unique}"));
+        fs::create_dir_all(&path).expect("temp dir should create");
+        path
+    }
 }

@@ -16,6 +16,7 @@ const DEFAULT_LEARNING_RATE: f64 = 1e-3;
 const DEFAULT_BETA1: f64 = 0.9;
 const DEFAULT_BETA2: f64 = 0.999;
 const DEFAULT_TRAIN_EPOCHS: usize = 10;
+const DEFAULT_MAX_TRAINING_SHORT_EDGE: u32 = 720;
 
 #[derive(Clone, Debug)]
 pub struct VideoInitOptions {
@@ -24,6 +25,7 @@ pub struct VideoInitOptions {
     pub initial_log_density: f64,
     pub train_epochs: usize,
     pub distortion_lambda: f64,
+    pub max_training_short_edge: Option<u32>,
 }
 
 impl Default for VideoInitOptions {
@@ -34,6 +36,7 @@ impl Default for VideoInitOptions {
             initial_log_density: DEFAULT_LOG_DENSITY,
             train_epochs: DEFAULT_TRAIN_EPOCHS,
             distortion_lambda: DEFAULT_DISTORTION_LAMBDA,
+            max_training_short_edge: Some(DEFAULT_MAX_TRAINING_SHORT_EDGE),
         }
     }
 }
@@ -143,11 +146,16 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
         workspace: &Path,
     ) -> Result<Scene, VideoInitError> {
         let workspace_layout = self.prepare_workspace(video_path, workspace)?;
-        let mut scene =
-            colmap::load_scene_from_colmap_text_model(&workspace_layout.text_dir, &self.options)?;
+        let mut scene = colmap::load_scene_from_colmap_text_model_without_neighbors(
+            &workspace_layout.text_dir,
+            &self.options,
+        )?;
         println!("scene has {} centroids", scene.centroid_x.len());
-        let frames =
-            colmap::load_training_frames(&workspace_layout.text_dir, &workspace_layout.frames_dir)?;
+        let frames = colmap::load_training_frames(
+            &workspace_layout.text_dir,
+            &workspace_layout.frames_dir,
+            &self.options,
+        )?;
         training::train_scene_on_frames(&self.options, &mut scene, &frames)?;
         Ok(scene)
     }
@@ -441,7 +449,8 @@ fn copy_dir_all(from: &Path, to: &Path) -> Result<(), VideoInitError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ColmapVideoInitializer, CommandRunner, VideoInitError, VideoInitOptions, load_cameras,
+        ColmapVideoInitializer, CommandRunner, VideoInitError, VideoInitOptions,
+        colmap::load_scene_from_colmap_text_model_without_neighbors, load_cameras,
         load_registered_images, load_scene_from_colmap_text_model,
     };
     use image::RgbImage;
@@ -551,6 +560,27 @@ mod tests {
         assert!((scene.centroid_r.values[0] - 1.0).abs() < 1e-9);
         assert!((scene.centroid_g.values[1] - 1.0).abs() < 1e-9);
         assert!((scene.centroid_b.values[0] - (128.0 / 255.0)).abs() < 1e-9);
+
+        fs::remove_dir_all(temp_dir).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn load_scene_for_training_defers_exact_neighbors() {
+        let temp_dir = make_temp_dir("colmap-points-deferred");
+        fs::write(
+            temp_dir.join("points3D.txt"),
+            "# header\n1 1.0 2.0 3.0 255 0 128 0.5\n2 -1.0 0.0 4.0 0 255 64 0.25\n",
+        )
+        .expect("point file should write");
+
+        let scene = load_scene_from_colmap_text_model_without_neighbors(
+            &temp_dir,
+            &VideoInitOptions::default(),
+        )
+        .expect("scene should parse");
+
+        assert_eq!(scene.centroid_x.len(), 2);
+        assert!(scene.centroid_neighbors.iter().all(Vec::is_empty));
 
         fs::remove_dir_all(temp_dir).expect("temp dir should clean up");
     }

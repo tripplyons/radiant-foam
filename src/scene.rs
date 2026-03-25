@@ -1,10 +1,12 @@
 use crate::parameter::{Parameter, ParameterError};
+use qhull_enhanced::Qh;
 use rand::RngExt;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::TAU;
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 
 const SPLIT_FALLBACK_OFFSET_MAGNITUDE: f64 = 1e-3;
 const SPLIT_SAMPLING_ATTEMPTS: usize = 64;
@@ -105,30 +107,9 @@ impl Scene {
 
     pub fn compute_neighbors(&mut self) -> Result<(), SceneError> {
         self.validate_lengths()?;
-        let count = self.centroid_x.len();
         let points = self.points();
-        let forward_neighbors = (0..count)
-            .into_par_iter()
-            .map(|i| {
-                let mut row = Vec::new();
-                for j in (i + 1)..count {
-                    if are_neighbors_for_points(&points, i, j) {
-                        row.push(j);
-                    }
-                }
-                row
-            })
-            .collect::<Vec<_>>();
-
-        let mut neighbors = vec![Vec::new(); count];
-        for (i, row) in forward_neighbors.into_iter().enumerate() {
-            for j in row {
-                neighbors[i].push(j);
-                neighbors[j].push(i);
-            }
-        }
-
-        self.centroid_neighbors = neighbors;
+        self.centroid_neighbors = exact_neighbors_for_points(&points)
+            .unwrap_or_else(|| sampled_neighbors_for_points(&points));
         Ok(())
     }
 
@@ -186,7 +167,6 @@ impl Scene {
         let new_index = count;
         self.centroid_neighbors.push(Vec::new());
         let points = self.points();
-
         let is_neighbor = are_neighbors_for_points(&points, index, new_index);
         self.set_neighbor_pair(index, new_index, is_neighbor);
 
@@ -332,7 +312,7 @@ fn are_neighbors_for_points(points: &[[f64; 3]], i: usize, j: usize) -> bool {
     let angles = unit_circle_samples();
 
     for &radius in &radii {
-        for [cos_theta, sin_theta] in angles {
+        for &[cos_theta, sin_theta] in angles {
             let offset = [
                 radius * (cos_theta * basis0[0] + sin_theta * basis1[0]),
                 radius * (cos_theta * basis0[1] + sin_theta * basis1[1]),
@@ -360,7 +340,6 @@ fn is_shared_closest_point_for_points(
 ) -> bool {
     let dij = dist_sq(q, points[i]);
     let eps = 1e-5 * (1.0 + dij.abs());
-
     for (k, &point) in points.iter().enumerate() {
         if k == i || k == j {
             continue;
@@ -373,11 +352,198 @@ fn is_shared_closest_point_for_points(
     true
 }
 
-fn unit_circle_samples() -> [[f64; 2]; 24] {
-    std::array::from_fn(|index| {
-        let angle = TAU * (index as f64 / 24.0);
-        [angle.cos(), angle.sin()]
+fn exact_neighbors_for_points(points: &[[f64; 3]]) -> Option<Vec<Vec<usize>>> {
+    let affine = AffineProjection::for_points(points);
+    match affine.dim {
+        0 => Some(vec![Vec::new(); points.len()]),
+        1 => Some(exact_neighbors_for_points_1d(points, &affine)),
+        2 => exact_neighbors_for_projected_points::<2>(points, &affine),
+        3 => exact_neighbors_for_projected_points::<3>(points, &affine),
+        _ => None,
+    }
+}
+
+fn exact_neighbors_for_points_1d(
+    points: &[[f64; 3]],
+    affine: &AffineProjection,
+) -> Vec<Vec<usize>> {
+    let mut projected = (0..points.len())
+        .map(|index| (index, affine.project_scalar(points[index], 0)))
+        .collect::<Vec<_>>();
+    projected.sort_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1));
+
+    let mut neighbors = vec![Vec::new(); points.len()];
+    let eps = affine.epsilon;
+    let mut groups = Vec::<Vec<usize>>::new();
+    for (index, value) in projected {
+        if let Some(last_group) = groups.last_mut() {
+            let representative = last_group[0];
+            let representative_value = affine.project_scalar(points[representative], 0);
+            if (value - representative_value).abs() <= eps {
+                last_group.push(index);
+                continue;
+            }
+        }
+        groups.push(vec![index]);
+    }
+
+    for pair in groups.windows(2) {
+        for &left in &pair[0] {
+            for &right in &pair[1] {
+                add_unique_neighbor(&mut neighbors[left], right);
+                add_unique_neighbor(&mut neighbors[right], left);
+            }
+        }
+    }
+
+    neighbors
+}
+
+fn exact_neighbors_for_projected_points<const D: usize>(
+    points: &[[f64; 3]],
+    affine: &AffineProjection,
+) -> Option<Vec<Vec<usize>>> {
+    let projected = points
+        .iter()
+        .map(|&point| affine.project(point))
+        .map(|coords| std::array::from_fn(|axis| coords[axis]))
+        .collect::<Vec<[f64; D]>>();
+    let qh = Qh::new_delaunay(projected).ok()?;
+    let mut neighbors = vec![Vec::new(); points.len()];
+
+    for simplex in qh
+        .simplices()
+        .filter(|facet| !facet.is_sentinel() && !facet.upper_delaunay())
+    {
+        let vertices = simplex
+            .vertices()?
+            .iter()
+            .filter_map(|vertex| vertex.index(&qh))
+            .collect::<Vec<_>>();
+        for left in 0..vertices.len() {
+            for right in (left + 1)..vertices.len() {
+                add_unique_neighbor(&mut neighbors[vertices[left]], vertices[right]);
+                add_unique_neighbor(&mut neighbors[vertices[right]], vertices[left]);
+            }
+        }
+    }
+
+    Some(neighbors)
+}
+
+fn sampled_neighbors_for_points(points: &[[f64; 3]]) -> Vec<Vec<usize>> {
+    let count = points.len();
+    let forward_neighbors = (0..count)
+        .into_par_iter()
+        .map(|i| {
+            let mut row = Vec::new();
+            for j in (i + 1)..count {
+                if are_neighbors_for_points(points, i, j) {
+                    row.push(j);
+                }
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+
+    let mut neighbors = vec![Vec::new(); count];
+    for (i, row) in forward_neighbors.into_iter().enumerate() {
+        for j in row {
+            neighbors[i].push(j);
+            neighbors[j].push(i);
+        }
+    }
+
+    neighbors
+}
+
+fn unit_circle_samples() -> &'static [[f64; 2]; 24] {
+    static SAMPLES: OnceLock<[[f64; 2]; 24]> = OnceLock::new();
+    SAMPLES.get_or_init(|| {
+        std::array::from_fn(|index| {
+            let angle = TAU * (index as f64 / 24.0);
+            [angle.cos(), angle.sin()]
+        })
     })
+}
+
+struct AffineProjection {
+    dim: usize,
+    origin: [f64; 3],
+    basis: [[f64; 3]; 3],
+    epsilon: f64,
+}
+
+impl AffineProjection {
+    fn for_points(points: &[[f64; 3]]) -> Self {
+        let origin = points.first().copied().unwrap_or([0.0, 0.0, 0.0]);
+        let extent = max_extent(points).max(1.0);
+        let epsilon = extent * 1e-9;
+
+        let Some(axis0_seed) = points
+            .iter()
+            .map(|&point| sub(point, origin))
+            .find(|&delta| norm(delta) > epsilon)
+        else {
+            return Self {
+                dim: 0,
+                origin,
+                basis: [[0.0; 3]; 3],
+                epsilon,
+            };
+        };
+        let axis0 = normalize(axis0_seed);
+
+        let Some(axis1_seed) = points
+            .iter()
+            .map(|&point| sub(point, origin))
+            .map(|delta| sub(delta, scale(axis0, dot(delta, axis0))))
+            .find(|&delta| norm(delta) > epsilon)
+        else {
+            return Self {
+                dim: 1,
+                origin,
+                basis: [axis0, [0.0; 3], [0.0; 3]],
+                epsilon,
+            };
+        };
+        let axis1 = normalize(axis1_seed);
+        let axis2 = normalize(cross(axis0, axis1));
+
+        if points
+            .iter()
+            .map(|&point| sub(point, origin))
+            .any(|delta| dot(delta, axis2).abs() > epsilon)
+        {
+            Self {
+                dim: 3,
+                origin,
+                basis: [axis0, axis1, axis2],
+                epsilon,
+            }
+        } else {
+            Self {
+                dim: 2,
+                origin,
+                basis: [axis0, axis1, [0.0; 3]],
+                epsilon,
+            }
+        }
+    }
+
+    fn project(&self, point: [f64; 3]) -> [f64; 3] {
+        let delta = sub(point, self.origin);
+        [
+            dot(delta, self.basis[0]),
+            dot(delta, self.basis[1]),
+            dot(delta, self.basis[2]),
+        ]
+    }
+
+    fn project_scalar(&self, point: [f64; 3], axis: usize) -> f64 {
+        let delta = sub(point, self.origin);
+        dot(delta, self.basis[axis])
+    }
 }
 impl Scene {
     fn point(&self, idx: usize) -> [f64; 3] {
@@ -518,6 +684,18 @@ fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn scale(v: [f64; 3], factor: f64) -> [f64; 3] {
+    [v[0] * factor, v[1] * factor, v[2] * factor]
+}
+
+fn norm(v: [f64; 3]) -> f64 {
+    dot(v, v).sqrt()
+}
+
 fn dist_sq(a: [f64; 3], b: [f64; 3]) -> f64 {
     let dx = a[0] - b[0];
     let dy = a[1] - b[1];
@@ -540,6 +718,18 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     ]
+}
+
+fn max_extent(points: &[[f64; 3]]) -> f64 {
+    let mut min = points.first().copied().unwrap_or([0.0; 3]);
+    let mut max = min;
+    for &point in points {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(point[axis]);
+            max[axis] = max[axis].max(point[axis]);
+        }
+    }
+    (0..3).map(|axis| max[axis] - min[axis]).fold(0.0, f64::max)
 }
 
 fn bisector_basis(normal: [f64; 3]) -> ([f64; 3], [f64; 3]) {
@@ -683,6 +873,27 @@ mod tests {
         assert_eq!(scene.centroid_neighbors[0], vec![1]);
         assert_eq!(scene.centroid_neighbors[1], vec![0, 2]);
         assert_eq!(scene.centroid_neighbors[2], vec![1]);
+    }
+
+    #[test]
+    fn compute_neighbors_for_tetrahedron() {
+        let mut scene = Scene {
+            centroid_x: Parameter::new(vec![0.0, 1.0, 0.0, 0.0], 1e-3, 0.9, 0.999),
+            centroid_y: Parameter::new(vec![0.0, 0.0, 1.0, 0.0], 1e-3, 0.9, 0.999),
+            centroid_z: Parameter::new(vec![0.0, 0.0, 0.0, 1.0], 1e-3, 0.9, 0.999),
+            centroid_opacity: Parameter::new(vec![1.0; 4], 1e-3, 0.9, 0.999),
+            centroid_r: Parameter::new(vec![0.0; 4], 1e-3, 0.9, 0.999),
+            centroid_g: Parameter::new(vec![0.0; 4], 1e-3, 0.9, 0.999),
+            centroid_b: Parameter::new(vec![0.0; 4], 1e-3, 0.9, 0.999),
+            centroid_neighbors: vec![Vec::new(); 4],
+        };
+
+        scene.compute_neighbors().expect("lengths are consistent");
+
+        assert_eq!(scene.centroid_neighbors[0], vec![1, 2, 3]);
+        assert_eq!(scene.centroid_neighbors[1], vec![0, 2, 3]);
+        assert_eq!(scene.centroid_neighbors[2], vec![0, 1, 3]);
+        assert_eq!(scene.centroid_neighbors[3], vec![0, 1, 2]);
     }
 
     #[test]

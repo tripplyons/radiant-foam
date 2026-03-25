@@ -1,9 +1,11 @@
 pub mod parameter;
+pub mod profile;
 pub mod renderer;
 pub mod scene;
 pub mod video;
 pub mod viewer;
 
+use crate::profile::run_profile;
 use crate::renderer::{OrthographicRenderer, Renderer};
 use crate::scene::Scene;
 use crate::video::{ColmapVideoInitializer, VideoInitOptions};
@@ -36,6 +38,13 @@ fn main() {
     }
     if args.get(1).map(String::as_str) == Some("train-video") {
         run_explicit_video_training(&args);
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("profile") {
+        if let Err(error) = run_profile(&args) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
         return;
     }
     if args.get(1).map(String::as_str) == Some("view-scene") {
