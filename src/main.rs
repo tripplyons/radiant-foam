@@ -17,9 +17,15 @@ fn main() {
     if args.len() == 2 {
         let input_path = Path::new(&args[1]);
         if input_path.extension().and_then(|ext| ext.to_str()) == Some("json") {
-            run_scene_viewer(input_path).expect("scene viewer should succeed");
+            if let Err(error) = run_scene_viewer(input_path) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
         } else {
-            run_video_training(input_path);
+            if let Err(error) = run_video_training(input_path) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -37,7 +43,10 @@ fn main() {
             eprintln!("usage: radiant-foam view-scene <scene-json>");
             std::process::exit(1);
         }
-        run_scene_viewer(Path::new(&args[2])).expect("scene viewer should succeed");
+        if let Err(error) = run_scene_viewer(Path::new(&args[2])) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -76,13 +85,10 @@ fn run_video_initialization(args: &[String]) {
         .map(PathBuf::from)
         .unwrap_or_else(|| scene_path.with_extension("colmap"));
 
-    let mut initializer = ColmapVideoInitializer::default();
-    let scene = initializer
-        .initialize_scene_from_video(video_path, &workspace)
-        .expect("video initialization should succeed");
-    scene
-        .save_to_json(scene_path)
-        .expect("scene should serialize");
+    if let Err(error) = run_video_initialization_impl(video_path, scene_path, &workspace) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
 }
 
 fn run_explicit_video_training(args: &[String]) {
@@ -98,24 +104,45 @@ fn run_explicit_video_training(args: &[String]) {
         .map(PathBuf::from)
         .unwrap_or_else(|| scene_path.with_extension("colmap"));
 
-    let mut initializer = ColmapVideoInitializer::default();
-    let scene = initializer
-        .initialize_and_train_from_video(video_path, &workspace)
-        .expect("video training should succeed");
-    scene
-        .save_to_json(scene_path)
-        .expect("scene should serialize");
+    if let Err(error) = run_video_training_impl(video_path, scene_path, &workspace) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
 }
 
-fn run_video_training(video_path: &Path) {
+fn run_video_training(video_path: &Path) -> Result<(), String> {
     let scene_path = video_path.with_extension("scene.json");
     let workspace = video_path.with_extension("radiant-foam");
 
+    run_video_training_impl(video_path, &scene_path, &workspace)
+}
+
+fn run_video_initialization_impl(
+    video_path: &Path,
+    scene_path: &Path,
+    workspace: &Path,
+) -> Result<(), String> {
     let mut initializer = ColmapVideoInitializer::default();
     let scene = initializer
-        .initialize_and_train_from_video(video_path, &workspace)
-        .expect("video training should succeed");
+        .initialize_scene_from_video(video_path, workspace)
+        .map_err(|error| format!("video initialization failed: {error:?}"))?;
     scene
-        .save_to_json(&scene_path)
-        .expect("scene should serialize");
+        .save_to_json(scene_path)
+        .map_err(|error| format!("failed to save scene {}: {error:?}", scene_path.display()))?;
+    Ok(())
+}
+
+fn run_video_training_impl(
+    video_path: &Path,
+    scene_path: &Path,
+    workspace: &Path,
+) -> Result<(), String> {
+    let mut initializer = ColmapVideoInitializer::default();
+    let scene = initializer
+        .initialize_and_train_from_video(video_path, workspace)
+        .map_err(|error| format!("video training failed: {error:?}"))?;
+    scene
+        .save_to_json(scene_path)
+        .map_err(|error| format!("failed to save scene {}: {error:?}", scene_path.display()))?;
+    Ok(())
 }

@@ -167,7 +167,7 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
 
         self.extract_frames(video_path, &frames_dir)?;
         self.run_feature_extractor(&database_path, &frames_dir)?;
-        self.run_sequential_matcher(&database_path)?;
+        self.run_exhaustive_matcher(&database_path)?;
         self.run_mapper(&database_path, &frames_dir, &sparse_dir)?;
 
         let sparse_model = first_sparse_model_dir(&sparse_dir)?;
@@ -213,13 +213,15 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
         )
     }
 
-    fn run_sequential_matcher(&mut self, database_path: &Path) -> Result<(), VideoInitError> {
+    fn run_exhaustive_matcher(&mut self, database_path: &Path) -> Result<(), VideoInitError> {
         self.runner.run(
             "colmap",
             &[
-                "sequential_matcher".to_string(),
+                "exhaustive_matcher".to_string(),
                 "--database_path".to_string(),
                 path_arg(database_path),
+                "--FeatureMatching.guided_matching".to_string(),
+                "1".to_string(),
             ],
         )
     }
@@ -240,6 +242,12 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
                 path_arg(frames_dir),
                 "--output_path".to_string(),
                 path_arg(sparse_dir),
+                "--Mapper.multiple_models".to_string(),
+                "0".to_string(),
+                "--Mapper.max_num_models".to_string(),
+                "1".to_string(),
+                "--Mapper.min_model_size".to_string(),
+                "3".to_string(),
             ],
         )
     }
@@ -804,8 +812,11 @@ mod tests {
         assert_eq!(initializer.runner.calls[0].0, "ffmpeg");
         assert_eq!(initializer.runner.calls[1].0, "colmap");
         assert_eq!(initializer.runner.calls[1].1[0], "feature_extractor");
-        assert_eq!(initializer.runner.calls[2].1[0], "sequential_matcher");
+        assert_eq!(initializer.runner.calls[2].1[0], "exhaustive_matcher");
         assert_eq!(initializer.runner.calls[3].1[0], "mapper");
+        assert!(initializer.runner.calls[2].1.contains(&"--FeatureMatching.guided_matching".to_string()));
+        assert!(initializer.runner.calls[3].1.contains(&"--Mapper.multiple_models".to_string()));
+        assert!(initializer.runner.calls[3].1.contains(&"0".to_string()));
         assert_eq!(initializer.runner.calls[4].1[0], "model_converter");
 
         fs::remove_dir_all(temp_dir).expect("temp dir should clean up");
