@@ -96,6 +96,15 @@ impl TrainingAccumulator {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct RayTraceScratch {
+    segments: Vec<RaySegment>,
+    boundary_grads: Vec<f64>,
+    distortion_weight_grads: Vec<f64>,
+    distortion_boundary_grads: Vec<f64>,
+    finite_indices: Vec<usize>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TrainStepResult {
     pub loss: f64,
@@ -208,9 +217,10 @@ impl OrthographicRenderer {
         pixels.par_chunks_mut(row_stride).enumerate().try_for_each(
             |(py, row)| -> Result<(), RendererError> {
                 let py = py as u32;
+                let mut scratch = RayTraceScratch::default();
                 for px in 0..self.width {
                     let start = self.pixel_to_world(px, py);
-                    let color = trace_ray_validated(scene, start, direction).0;
+                    let color = trace_ray_validated(scene, start, direction, &mut scratch);
 
                     let idx = (px as usize) * 3;
                     row[idx] = color[0];
@@ -269,9 +279,10 @@ impl OrthographicRenderer {
             .map(|py| {
                 let py = py as u32;
                 let mut accumulator = TrainingAccumulator::zeros(count);
+                let mut scratch = RayTraceScratch::default();
                 for px in 0..self.width {
                     let start = self.pixel_to_world(px, py);
-                    let (pixel_color, segments) = trace_ray_validated(scene, start, direction);
+                    let pixel_color = trace_ray_validated(scene, start, direction, &mut scratch);
                     let pixel_index = ((py * self.width + px) as usize) * 3;
                     let target_rgb = [
                         target.pixels[pixel_index] as f64 * target_scale,
@@ -287,11 +298,11 @@ impl OrthographicRenderer {
                     accumulator.rgb_loss += squared_distance(pixel_color, target_rgb);
                     accumulator.distortion_loss += accumulate_trace_gradients(
                         scene,
-                        &segments,
                         start,
                         direction,
                         output_grad,
                         distortion_normalizer,
+                        &mut scratch,
                         &mut accumulator.gradients,
                     );
                 }
@@ -352,9 +363,10 @@ impl PerspectiveRenderer {
         pixels.par_chunks_mut(row_stride).enumerate().try_for_each(
             |(py, row)| -> Result<(), RendererError> {
                 let py = py as u32;
+                let mut scratch = RayTraceScratch::default();
                 for px in 0..self.camera.width {
                     let (start, direction) = self.camera.pixel_to_world_ray(px, py);
-                    let color = trace_ray_validated(scene, start, direction).0;
+                    let color = trace_ray_validated(scene, start, direction, &mut scratch);
 
                     let idx = (px as usize) * 3;
                     row[idx] = color[0];
@@ -394,9 +406,10 @@ impl PerspectiveRenderer {
             .map(|py| {
                 let py = py as u32;
                 let mut accumulator = TrainingAccumulator::zeros(count);
+                let mut scratch = RayTraceScratch::default();
                 for px in 0..self.camera.width {
                     let (start, direction) = self.camera.pixel_to_world_ray(px, py);
-                    let (pixel_color, segments) = trace_ray_validated(scene, start, direction);
+                    let pixel_color = trace_ray_validated(scene, start, direction, &mut scratch);
                     let pixel_index = ((py * self.camera.width + px) as usize) * 3;
                     let target_rgb = [
                         target.pixels[pixel_index] as f64 * target_scale,
@@ -412,11 +425,11 @@ impl PerspectiveRenderer {
                     accumulator.rgb_loss += squared_distance(pixel_color, target_rgb);
                     accumulator.distortion_loss += accumulate_trace_gradients(
                         scene,
-                        &segments,
                         start,
                         direction,
                         output_grad,
                         distortion_normalizer,
+                        &mut scratch,
                         &mut accumulator.gradients,
                     );
                 }
@@ -554,35 +567,44 @@ fn squared_distance(a: [f64; 3], b: [f64; 3]) -> f64 {
     dx * dx + dy * dy + dz * dz
 }
 
-fn distortion_loss_and_gradients(segments: &[RaySegment]) -> (f64, Vec<f64>, Vec<f64>) {
-    let mut weight_grads = vec![0.0_f64; segments.len()];
-    let mut boundary_grads = vec![0.0_f64; segments.len()];
-    let finite_indices = segments
-        .iter()
-        .enumerate()
-        .filter_map(|(index, segment)| segment.segment_length.map(|_| index))
-        .collect::<Vec<_>>();
+fn distortion_loss_and_gradients(scratch: &mut RayTraceScratch) -> f64 {
+    scratch.distortion_weight_grads.clear();
+    scratch
+        .distortion_weight_grads
+        .resize(scratch.segments.len(), 0.0);
+    scratch.distortion_boundary_grads.clear();
+    scratch
+        .distortion_boundary_grads
+        .resize(scratch.segments.len(), 0.0);
+    scratch.finite_indices.clear();
+    scratch.finite_indices.extend(
+        scratch
+            .segments
+            .iter()
+            .enumerate()
+            .filter_map(|(index, segment)| segment.segment_length.map(|_| index)),
+    );
 
-    if finite_indices.is_empty() {
-        return (0.0, weight_grads, boundary_grads);
+    if scratch.finite_indices.is_empty() {
+        return 0.0;
     }
 
     let mut loss = 0.0_f64;
 
-    for &index in &finite_indices {
-        let segment = &segments[index];
+    for &index in &scratch.finite_indices {
+        let segment = &scratch.segments[index];
         let delta = segment.segment_length.expect("finite segment should have length");
         let weight = segment.remaining_before * segment.alpha;
         let midpoint = segment.start_t + 0.5 * delta;
 
         loss += (weight * weight * delta) / 3.0;
-        weight_grads[index] += (2.0 / 3.0) * weight * delta;
+        scratch.distortion_weight_grads[index] += (2.0 / 3.0) * weight * delta;
 
-        for &other_index in &finite_indices {
+        for &other_index in &scratch.finite_indices {
             if index == other_index {
                 continue;
             }
-            let other_segment = &segments[other_index];
+            let other_segment = &scratch.segments[other_index];
             let other_delta = other_segment
                 .segment_length
                 .expect("finite segment should have length");
@@ -592,23 +614,23 @@ fn distortion_loss_and_gradients(segments: &[RaySegment]) -> (f64, Vec<f64>, Vec
             let sign = (midpoint - other_midpoint).signum();
 
             loss += weight * other_weight * distance;
-            weight_grads[index] += other_weight * distance;
+            scratch.distortion_weight_grads[index] += other_weight * distance;
 
             let midpoint_grad = weight * other_weight * sign;
             if index > 0 {
-                boundary_grads[index - 1] += 0.5 * midpoint_grad;
+                scratch.distortion_boundary_grads[index - 1] += 0.5 * midpoint_grad;
             }
-            boundary_grads[index] += 0.5 * midpoint_grad;
+            scratch.distortion_boundary_grads[index] += 0.5 * midpoint_grad;
         }
 
         let delta_grad = (weight * weight) / 3.0;
         if index > 0 {
-            boundary_grads[index - 1] -= delta_grad;
+            scratch.distortion_boundary_grads[index - 1] -= delta_grad;
         }
-        boundary_grads[index] += delta_grad;
+        scratch.distortion_boundary_grads[index] += delta_grad;
     }
 
-    (loss, weight_grads, boundary_grads)
+    loss
 }
 
 fn validate_scene(scene: &Scene) -> Result<usize, SceneError> {
@@ -648,12 +670,13 @@ fn trace_ray_validated(
     scene: &Scene,
     ray_origin: [f64; 3],
     direction: [f64; 3],
-) -> ([f64; 3], Vec<RaySegment>) {
+    scratch: &mut RayTraceScratch,
+) -> [f64; 3] {
     let mut color = [0.0, 0.0, 0.0];
     let mut remaining = 1.0_f64;
     let mut current = closest_centroid_at_point(scene, ray_origin);
     let mut t0 = 0.0_f64;
-    let mut segments = Vec::new();
+    scratch.segments.clear();
 
     while remaining > TRANSMITTANCE_EPSILON {
         let next = next_centroid_along_ray(scene, current, ray_origin, direction, t0);
@@ -671,7 +694,7 @@ fn trace_ray_validated(
         color[1] += centroid_color[1] * weight;
         color[2] += centroid_color[2] * weight;
 
-        segments.push(RaySegment {
+        scratch.segments.push(RaySegment {
             centroid_index: current,
             next_index: next.map(|(next_index, _)| next_index),
             start_t: t0,
@@ -691,30 +714,32 @@ fn trace_ray_validated(
         t0 = t_cross;
     }
 
-    (color, segments)
+    color
 }
 
 fn accumulate_trace_gradients(
     scene: &Scene,
-    segments: &[RaySegment],
     ray_origin: [f64; 3],
     direction: [f64; 3],
     output_grad: [f64; 3],
     distortion_normalizer: f64,
+    scratch: &mut RayTraceScratch,
     gradients: &mut SceneGradients,
 ) -> f64 {
     let mut grad_remaining = 0.0_f64;
-    let mut boundary_grads = vec![0.0_f64; segments.len()];
-    let (distortion_loss, distortion_weight_grads, distortion_boundary_grads) =
-        distortion_loss_and_gradients(segments);
+    scratch.boundary_grads.clear();
+    scratch
+        .boundary_grads
+        .resize(scratch.segments.len(), 0.0);
+    let distortion_loss = distortion_loss_and_gradients(scratch);
 
-    for segment_index in (0..segments.len()).rev() {
-        let segment = &segments[segment_index];
+    for segment_index in (0..scratch.segments.len()).rev() {
+        let segment = &scratch.segments[segment_index];
         let centroid_index = segment.centroid_index;
         let centroid_color = centroid_color(scene, centroid_index);
         let weight = segment.remaining_before * segment.alpha;
-        let grad_weight =
-            dot(output_grad, centroid_color) + distortion_normalizer * distortion_weight_grads[segment_index];
+        let grad_weight = dot(output_grad, centroid_color)
+            + distortion_normalizer * scratch.distortion_weight_grads[segment_index];
         let grad_alpha =
             grad_weight * segment.remaining_before - grad_remaining * segment.remaining_before;
 
@@ -731,24 +756,24 @@ fn accumulate_trace_gradients(
                 grad_alpha * segment.sigma * length * transmission;
 
             let grad_length = grad_alpha * segment.sigma * transmission;
-            boundary_grads[segment_index] += grad_length;
+            scratch.boundary_grads[segment_index] += grad_length;
             if segment_index > 0 {
-                boundary_grads[segment_index - 1] -= grad_length;
+                scratch.boundary_grads[segment_index - 1] -= grad_length;
             }
         }
 
         grad_remaining = grad_weight * segment.alpha + grad_remaining * (1.0 - segment.alpha);
     }
 
-    for (boundary_index, grad) in boundary_grads.iter_mut().enumerate() {
-        *grad += distortion_normalizer * distortion_boundary_grads[boundary_index];
+    for (boundary_index, grad) in scratch.boundary_grads.iter_mut().enumerate() {
+        *grad += distortion_normalizer * scratch.distortion_boundary_grads[boundary_index];
     }
 
-    for (boundary_index, &grad_t) in boundary_grads.iter().enumerate() {
+    for (boundary_index, &grad_t) in scratch.boundary_grads.iter().enumerate() {
         if grad_t == 0.0 {
             continue;
         }
-        let segment = &segments[boundary_index];
+        let segment = &scratch.segments[boundary_index];
         let Some(next_index) = segment.next_index else {
             continue;
         };
