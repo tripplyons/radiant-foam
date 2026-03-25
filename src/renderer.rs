@@ -132,6 +132,25 @@ enum TraversalMode {
     AllCentroids,
 }
 
+const TRAINING_TREE_LEAF_SIZE: usize = 8;
+
+#[derive(Clone, Debug)]
+struct CentroidTree {
+    indices: Vec<usize>,
+    nodes: Vec<CentroidTreeNode>,
+    root: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CentroidTreeNode {
+    start: usize,
+    end: usize,
+    left: Option<usize>,
+    right: Option<usize>,
+    bounds_min: [f64; 3],
+    bounds_max: [f64; 3],
+}
+
 pub trait Renderer {
     fn render(&self, scene: &Scene) -> Result<ImageData, RendererError>;
     fn train_step(
@@ -249,6 +268,208 @@ impl PerspectiveRenderPlan {
     }
 }
 
+impl CentroidTree {
+    fn build(scene: &Scene) -> Self {
+        let mut indices = (0..scene.centroid_x.len()).collect::<Vec<_>>();
+        let mut nodes = Vec::new();
+        let root = Self::build_node(scene, &mut indices, &mut nodes, 0, scene.centroid_x.len());
+        Self { indices, nodes, root }
+    }
+
+    fn build_node(
+        scene: &Scene,
+        indices: &mut [usize],
+        nodes: &mut Vec<CentroidTreeNode>,
+        start: usize,
+        end: usize,
+    ) -> usize {
+        let (bounds_min, bounds_max) = bounds_for_indices(scene, &indices[start..end]);
+        let node_index = nodes.len();
+        nodes.push(CentroidTreeNode {
+            start,
+            end,
+            left: None,
+            right: None,
+            bounds_min,
+            bounds_max,
+        });
+
+        if end - start > TRAINING_TREE_LEAF_SIZE {
+            let axis = longest_axis(bounds_min, bounds_max);
+            let mid = start + (end - start) / 2;
+            indices[start..end].select_nth_unstable_by(mid - start, |left, right| {
+                point(scene, *left)[axis]
+                    .partial_cmp(&point(scene, *right)[axis])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let left = Self::build_node(scene, indices, nodes, start, mid);
+            let right = Self::build_node(scene, indices, nodes, mid, end);
+            nodes[node_index].left = Some(left);
+            nodes[node_index].right = Some(right);
+        }
+
+        node_index
+    }
+
+    fn closest_centroid_at_point(&self, scene: &Scene, query: [f64; 3]) -> usize {
+        let mut best_index = self.indices[0];
+        let mut best_distance = dist_sq(query, point(scene, best_index));
+        self.closest_centroid_in_node(scene, self.root, query, &mut best_index, &mut best_distance);
+        best_index
+    }
+
+    fn closest_centroid_in_node(
+        &self,
+        scene: &Scene,
+        node_index: usize,
+        query: [f64; 3],
+        best_index: &mut usize,
+        best_distance: &mut f64,
+    ) {
+        let node = &self.nodes[node_index];
+        if distance_sq_to_bounds(query, node.bounds_min, node.bounds_max) >= *best_distance {
+            return;
+        }
+
+        if let (Some(left), Some(right)) = (node.left, node.right) {
+            let left_distance =
+                distance_sq_to_bounds(query, self.nodes[left].bounds_min, self.nodes[left].bounds_max);
+            let right_distance =
+                distance_sq_to_bounds(query, self.nodes[right].bounds_min, self.nodes[right].bounds_max);
+            let (first, second) = if left_distance <= right_distance {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            self.closest_centroid_in_node(scene, first, query, best_index, best_distance);
+            self.closest_centroid_in_node(scene, second, query, best_index, best_distance);
+            return;
+        }
+
+        for &candidate in &self.indices[node.start..node.end] {
+            let distance = dist_sq(query, point(scene, candidate));
+            if distance < *best_distance {
+                *best_distance = distance;
+                *best_index = candidate;
+            }
+        }
+    }
+
+    fn next_centroid_along_ray(
+        &self,
+        scene: &Scene,
+        current: usize,
+        ray_origin: [f64; 3],
+        direction: [f64; 3],
+        t0: f64,
+    ) -> Option<(usize, f64)> {
+        let pi = point(scene, current);
+        let origin_constant = dot(pi, pi) - 2.0 * dot(pi, ray_origin);
+        let mut best = None;
+        self.next_centroid_in_node(
+            scene,
+            self.root,
+            current,
+            pi,
+            origin_constant,
+            ray_origin,
+            direction,
+            t0,
+            &mut best,
+        );
+        best
+    }
+
+    fn next_centroid_in_node(
+        &self,
+        scene: &Scene,
+        node_index: usize,
+        current: usize,
+        current_point: [f64; 3],
+        origin_constant: f64,
+        ray_origin: [f64; 3],
+        direction: [f64; 3],
+        t0: f64,
+        best: &mut Option<(usize, f64)>,
+    ) {
+        let node = &self.nodes[node_index];
+        let lower_bound = crossing_time_lower_bound_for_bounds(
+            node.bounds_min,
+            node.bounds_max,
+            current_point,
+            origin_constant,
+            ray_origin,
+            direction,
+        );
+        let best_time = best.map_or(f64::INFINITY, |(_, time)| time);
+        if lower_bound >= best_time {
+            return;
+        }
+
+        if let (Some(left), Some(right)) = (node.left, node.right) {
+            let left_lower_bound = crossing_time_lower_bound_for_bounds(
+                self.nodes[left].bounds_min,
+                self.nodes[left].bounds_max,
+                current_point,
+                origin_constant,
+                ray_origin,
+                direction,
+            );
+            let right_lower_bound = crossing_time_lower_bound_for_bounds(
+                self.nodes[right].bounds_min,
+                self.nodes[right].bounds_max,
+                current_point,
+                origin_constant,
+                ray_origin,
+                direction,
+            );
+            let (first, second) = if left_lower_bound <= right_lower_bound {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            self.next_centroid_in_node(
+                scene,
+                first,
+                current,
+                current_point,
+                origin_constant,
+                ray_origin,
+                direction,
+                t0,
+                best,
+            );
+            self.next_centroid_in_node(
+                scene,
+                second,
+                current,
+                current_point,
+                origin_constant,
+                ray_origin,
+                direction,
+                t0,
+                best,
+            );
+            return;
+        }
+
+        for &candidate in &self.indices[node.start..node.end] {
+            if candidate == current {
+                continue;
+            }
+            if let Some(time) =
+                boundary_crossing_time(scene, current_point, candidate, ray_origin, direction, t0)
+            {
+                match best {
+                    None => *best = Some((candidate, time)),
+                    Some((_, best_time)) if time < *best_time => *best = Some((candidate, time)),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct OrthographicRenderer {
     pub width: u32,
@@ -299,6 +520,7 @@ impl OrthographicRenderer {
                         plan.direction,
                         &mut scratch,
                         TraversalMode::NeighborGraph,
+                        None,
                     );
 
                     let idx = (px as usize) * 3;
@@ -345,6 +567,7 @@ impl OrthographicRenderer {
         self.validate_target(target)?;
         let count = validate_scene_points(scene)?;
         let plan = OrthographicRenderPlan::build(self)?;
+        let training_tree = CentroidTree::build(scene);
 
         let normalizer = 2.0 / ((self.width as usize * self.height as usize * 3) as f64);
         let distortion_normalizer =
@@ -364,6 +587,7 @@ impl OrthographicRenderer {
                         plan.direction,
                         &mut scratch,
                         TraversalMode::AllCentroids,
+                        Some(&training_tree),
                     );
                     let pixel_index = ((py * self.width + px) as usize) * 3;
                     let target_rgb = [
@@ -455,6 +679,7 @@ impl PerspectiveRenderer {
                         direction,
                         &mut scratch,
                         TraversalMode::NeighborGraph,
+                        None,
                     );
 
                     let idx = (px as usize) * 3;
@@ -485,6 +710,7 @@ impl PerspectiveRenderer {
         self.validate_target(target)?;
         let count = validate_scene_points(scene)?;
         let plan = PerspectiveRenderPlan::build(&self.camera);
+        let training_tree = CentroidTree::build(scene);
 
         let normalizer =
             2.0 / ((self.camera.width as usize * self.camera.height as usize * 3) as f64);
@@ -505,6 +731,7 @@ impl PerspectiveRenderer {
                         direction,
                         &mut scratch,
                         TraversalMode::AllCentroids,
+                        Some(&training_tree),
                     );
                     let pixel_index = ((py * self.camera.width + px) as usize) * 3;
                     let target_rgb = [
@@ -824,16 +1051,17 @@ fn trace_ray(
     direction: [f64; 3],
     scratch: &mut RayTraceScratch,
     traversal_mode: TraversalMode,
+    training_tree: Option<&CentroidTree>,
 ) -> [f64; 3] {
     let mut color = [0.0, 0.0, 0.0];
     let mut remaining = 1.0_f64;
-    let mut current = closest_centroid_at_point(scene, ray_origin);
+    let mut current = closest_centroid_at_point(scene, ray_origin, traversal_mode, training_tree);
     let mut t0 = 0.0_f64;
     scratch.segments.clear();
 
     while remaining > TRANSMITTANCE_EPSILON {
         let next =
-            next_centroid_along_ray(scene, current, ray_origin, direction, t0, traversal_mode);
+            next_centroid_along_ray(scene, current, ray_origin, direction, t0, traversal_mode, training_tree);
         let centroid_color = centroid_color(scene, current);
         let log_density = scene.centroid_opacity.values[current];
         let sigma = log_density.exp();
@@ -1038,7 +1266,147 @@ fn centroid_color(scene: &Scene, idx: usize) -> [f64; 3] {
     ]
 }
 
-fn closest_centroid_at_point(scene: &Scene, q: [f64; 3]) -> usize {
+fn bounds_for_indices(scene: &Scene, indices: &[usize]) -> ([f64; 3], [f64; 3]) {
+    let mut bounds_min = [f64::INFINITY; 3];
+    let mut bounds_max = [f64::NEG_INFINITY; 3];
+    for &index in indices {
+        let position = point(scene, index);
+        for axis in 0..3 {
+            bounds_min[axis] = bounds_min[axis].min(position[axis]);
+            bounds_max[axis] = bounds_max[axis].max(position[axis]);
+        }
+    }
+    (bounds_min, bounds_max)
+}
+
+fn longest_axis(bounds_min: [f64; 3], bounds_max: [f64; 3]) -> usize {
+    let extents = [
+        bounds_max[0] - bounds_min[0],
+        bounds_max[1] - bounds_min[1],
+        bounds_max[2] - bounds_min[2],
+    ];
+    if extents[0] >= extents[1] && extents[0] >= extents[2] {
+        0
+    } else if extents[1] >= extents[2] {
+        1
+    } else {
+        2
+    }
+}
+
+fn distance_sq_to_bounds(query: [f64; 3], bounds_min: [f64; 3], bounds_max: [f64; 3]) -> f64 {
+    let mut distance = 0.0_f64;
+    for axis in 0..3 {
+        let clamped = query[axis].clamp(bounds_min[axis], bounds_max[axis]);
+        let delta = query[axis] - clamped;
+        distance += delta * delta;
+    }
+    distance
+}
+
+fn boundary_crossing_time(
+    scene: &Scene,
+    current_point: [f64; 3],
+    candidate: usize,
+    ray_origin: [f64; 3],
+    direction: [f64; 3],
+    t0: f64,
+) -> Option<f64> {
+    let candidate_point = point(scene, candidate);
+    let rhs = dot(candidate_point, candidate_point) - dot(current_point, current_point);
+    let delta = [
+        candidate_point[0] - current_point[0],
+        candidate_point[1] - current_point[1],
+        candidate_point[2] - current_point[2],
+    ];
+    let denominator = 2.0 * dot(delta, direction);
+    if denominator.abs() < 1e-8 || denominator <= 0.0 {
+        return None;
+    }
+
+    let numerator = rhs - 2.0 * dot(delta, ray_origin);
+    let time = numerator / denominator;
+    if time <= t0 + RAY_ADVANCE_EPSILON {
+        None
+    } else {
+        Some(time)
+    }
+}
+
+fn crossing_time_lower_bound_for_bounds(
+    bounds_min: [f64; 3],
+    bounds_max: [f64; 3],
+    current_point: [f64; 3],
+    origin_constant: f64,
+    ray_origin: [f64; 3],
+    direction: [f64; 3],
+) -> f64 {
+    let (denominator_min, denominator_max) =
+        denominator_bounds(bounds_min, bounds_max, current_point, direction);
+    if denominator_max <= 0.0 {
+        return f64::INFINITY;
+    }
+
+    let numerator_min = numerator_min_for_bounds(bounds_min, bounds_max, ray_origin) - origin_constant;
+    if denominator_min <= 0.0 {
+        if numerator_min < 0.0 {
+            f64::NEG_INFINITY
+        } else {
+            numerator_min / denominator_max
+        }
+    } else if numerator_min < 0.0 {
+        numerator_min / denominator_min
+    } else {
+        numerator_min / denominator_max
+    }
+}
+
+fn denominator_bounds(
+    bounds_min: [f64; 3],
+    bounds_max: [f64; 3],
+    current_point: [f64; 3],
+    direction: [f64; 3],
+) -> (f64, f64) {
+    let mut minimum = 0.0_f64;
+    let mut maximum = 0.0_f64;
+    for axis in 0..3 {
+        let low = 2.0 * (bounds_min[axis] - current_point[axis]) * direction[axis];
+        let high = 2.0 * (bounds_max[axis] - current_point[axis]) * direction[axis];
+        minimum += low.min(high);
+        maximum += low.max(high);
+    }
+    (minimum, maximum)
+}
+
+fn numerator_min_for_bounds(
+    bounds_min: [f64; 3],
+    bounds_max: [f64; 3],
+    ray_origin: [f64; 3],
+) -> f64 {
+    let mut minimum = 0.0_f64;
+    for axis in 0..3 {
+        minimum += quadratic_min_over_interval(bounds_min[axis], bounds_max[axis], ray_origin[axis]);
+    }
+    minimum
+}
+
+fn quadratic_min_over_interval(minimum: f64, maximum: f64, center: f64) -> f64 {
+    let clamped = center.clamp(minimum, maximum);
+    clamped * clamped - 2.0 * center * clamped
+}
+
+fn closest_centroid_at_point(
+    scene: &Scene,
+    q: [f64; 3],
+    traversal_mode: TraversalMode,
+    training_tree: Option<&CentroidTree>,
+) -> usize {
+    if matches!(traversal_mode, TraversalMode::AllCentroids) {
+        if let Some(tree) = training_tree {
+            return tree.closest_centroid_at_point(scene, q);
+        }
+    }
+
     let mut best_idx = 0usize;
     let mut best_dist = dist_sq(q, point(scene, 0));
     for index in 1..scene.centroid_x.len() {
@@ -1058,6 +1426,7 @@ fn next_centroid_along_ray(
     direction: [f64; 3],
     t0: f64,
     traversal_mode: TraversalMode,
+    training_tree: Option<&CentroidTree>,
 ) -> Option<(usize, f64)> {
     match traversal_mode {
         TraversalMode::NeighborGraph => next_centroid_along_ray_neighbors(
@@ -1067,9 +1436,10 @@ fn next_centroid_along_ray(
             direction,
             t0,
         ),
-        TraversalMode::AllCentroids => {
-            next_centroid_along_ray_all(scene, current, ray_origin, direction, t0)
-        }
+        TraversalMode::AllCentroids => training_tree.map_or_else(
+            || next_centroid_along_ray_all(scene, current, ray_origin, direction, t0),
+            |tree| tree.next_centroid_along_ray(scene, current, ray_origin, direction, t0),
+        ),
     }
 }
 
