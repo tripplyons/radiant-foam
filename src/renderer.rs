@@ -151,6 +151,11 @@ struct CentroidTreeNode {
     bounds_max: [f64; 3],
 }
 
+#[derive(Default)]
+pub struct TrainingTopologyCache {
+    tree: Option<CentroidTree>,
+}
+
 pub trait Renderer {
     fn render(&self, scene: &Scene) -> Result<ImageData, RendererError>;
     fn train_step(
@@ -470,6 +475,16 @@ impl CentroidTree {
     }
 }
 
+impl TrainingTopologyCache {
+    fn tree<'a>(&'a mut self, scene: &Scene) -> &'a CentroidTree {
+        self.tree.get_or_insert_with(|| CentroidTree::build(scene))
+    }
+
+    fn invalidate_positions(&mut self) {
+        self.tree = None;
+    }
+}
+
 #[derive(Debug)]
 pub struct OrthographicRenderer {
     pub width: u32,
@@ -565,9 +580,20 @@ impl OrthographicRenderer {
         target: &ImageData,
     ) -> Result<TrainStepResult, RendererError> {
         self.validate_target(target)?;
+        let mut cache = TrainingTopologyCache::default();
+        self.compute_training_signal_with_cache(scene, target, &mut cache)
+    }
+
+    fn compute_training_signal_with_cache(
+        &self,
+        scene: &Scene,
+        target: &ImageData,
+        cache: &mut TrainingTopologyCache,
+    ) -> Result<TrainStepResult, RendererError> {
+        self.validate_target(target)?;
         let count = validate_scene_points(scene)?;
         let plan = OrthographicRenderPlan::build(self)?;
-        let training_tree = CentroidTree::build(scene);
+        let training_tree = cache.tree(scene);
 
         let normalizer = 2.0 / ((self.width as usize * self.height as usize * 3) as f64);
         let distortion_normalizer =
@@ -708,9 +734,20 @@ impl PerspectiveRenderer {
         target: &ImageData,
     ) -> Result<TrainStepResult, RendererError> {
         self.validate_target(target)?;
+        let mut cache = TrainingTopologyCache::default();
+        self.compute_training_signal_with_cache(scene, target, &mut cache)
+    }
+
+    fn compute_training_signal_with_cache(
+        &self,
+        scene: &Scene,
+        target: &ImageData,
+        cache: &mut TrainingTopologyCache,
+    ) -> Result<TrainStepResult, RendererError> {
+        self.validate_target(target)?;
         let count = validate_scene_points(scene)?;
         let plan = PerspectiveRenderPlan::build(&self.camera);
-        let training_tree = CentroidTree::build(scene);
+        let training_tree = cache.tree(scene);
 
         let normalizer =
             2.0 / ((self.camera.width as usize * self.camera.height as usize * 3) as f64);
@@ -844,8 +881,21 @@ impl OrthographicRenderer {
         scene: &mut Scene,
         target: &ImageData,
     ) -> Result<TrainStepResult, RendererError> {
-        let result = self.compute_training_signal(scene, target)?;
-        apply_gradients(scene, &result.gradients)?;
+        let mut cache = TrainingTopologyCache::default();
+        let result = self.train_step_with_cache_without_neighbor_refresh(scene, target, &mut cache)?;
+        Ok(result)
+    }
+
+    pub fn train_step_with_cache_without_neighbor_refresh(
+        &self,
+        scene: &mut Scene,
+        target: &ImageData,
+        cache: &mut TrainingTopologyCache,
+    ) -> Result<TrainStepResult, RendererError> {
+        let result = self.compute_training_signal_with_cache(scene, target, cache)?;
+        if apply_gradients(scene, &result.gradients)? {
+            cache.invalidate_positions();
+        }
         Ok(result)
     }
 }
@@ -856,8 +906,21 @@ impl PerspectiveRenderer {
         scene: &mut Scene,
         target: &ImageData,
     ) -> Result<TrainStepResult, RendererError> {
-        let result = self.compute_training_signal(scene, target)?;
-        apply_gradients(scene, &result.gradients)?;
+        let mut cache = TrainingTopologyCache::default();
+        let result = self.train_step_with_cache_without_neighbor_refresh(scene, target, &mut cache)?;
+        Ok(result)
+    }
+
+    pub fn train_step_with_cache_without_neighbor_refresh(
+        &self,
+        scene: &mut Scene,
+        target: &ImageData,
+        cache: &mut TrainingTopologyCache,
+    ) -> Result<TrainStepResult, RendererError> {
+        let result = self.compute_training_signal_with_cache(scene, target, cache)?;
+        if apply_gradients(scene, &result.gradients)? {
+            cache.invalidate_positions();
+        }
         Ok(result)
     }
 }
@@ -879,17 +942,23 @@ fn validate_target_dimensions(
     }
 }
 
-fn apply_gradients(scene: &mut Scene, gradients: &SceneGradients) -> Result<(), RendererError> {
-    scene.centroid_x.update_adam(&gradients.centroid_x)?;
-    scene.centroid_y.update_adam(&gradients.centroid_y)?;
-    scene.centroid_z.update_adam(&gradients.centroid_z)?;
+fn apply_gradients(scene: &mut Scene, gradients: &SceneGradients) -> Result<bool, RendererError> {
+    let x_changed = scene
+        .centroid_x
+        .update_adam_and_report_change(&gradients.centroid_x)?;
+    let y_changed = scene
+        .centroid_y
+        .update_adam_and_report_change(&gradients.centroid_y)?;
+    let z_changed = scene
+        .centroid_z
+        .update_adam_and_report_change(&gradients.centroid_z)?;
     scene
         .centroid_opacity
         .update_adam(&gradients.centroid_opacity)?;
     scene.centroid_r.update_adam(&gradients.centroid_r)?;
     scene.centroid_g.update_adam(&gradients.centroid_g)?;
     scene.centroid_b.update_adam(&gradients.centroid_b)?;
-    Ok(())
+    Ok(x_changed || y_changed || z_changed)
 }
 
 fn add_vec_in_place(target: &mut [f64], source: &[f64]) {

@@ -1,5 +1,7 @@
 use crate::parameter::Parameter;
-use crate::renderer::{ImageData, PerspectiveCamera, PerspectiveRenderer, RendererError};
+use crate::renderer::{
+    ImageData, PerspectiveCamera, PerspectiveRenderer, RendererError, TrainingTopologyCache,
+};
 use crate::scene::{Scene, SceneError};
 use std::collections::HashMap;
 use std::fs;
@@ -397,6 +399,7 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
             frames.len(),
             self.options.train_epochs,
         );
+        let mut topology_cache = TrainingTopologyCache::default();
         for epoch_index in 0..self.options.train_epochs {
             let mut epoch_total_loss = 0.0_f64;
             let mut epoch_rgb_loss = 0.0_f64;
@@ -407,7 +410,11 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
                     frame.camera.clone(),
                     self.options.distortion_lambda,
                 );
-                let result = renderer.train_step_without_neighbor_refresh(scene, &frame.target)?;
+                let result = renderer.train_step_with_cache_without_neighbor_refresh(
+                    scene,
+                    &frame.target,
+                    &mut topology_cache,
+                )?;
                 epoch_total_loss += result.loss;
                 epoch_rgb_loss += result.rgb_loss;
                 epoch_distortion_loss += result.distortion_loss;

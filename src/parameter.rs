@@ -41,6 +41,13 @@ impl Parameter {
     }
 
     pub fn update_adam(&mut self, gradients: &[f64]) -> Result<(), ParameterError> {
+        self.update_adam_and_report_change(gradients).map(|_| ())
+    }
+
+    pub fn update_adam_and_report_change(
+        &mut self,
+        gradients: &[f64],
+    ) -> Result<bool, ParameterError> {
         if gradients.len() != self.values.len() {
             return Err(ParameterError::GradientLengthMismatch {
                 expected: self.values.len(),
@@ -51,7 +58,8 @@ impl Parameter {
         self.step = self.step.saturating_add(1);
         let t = self.step as f64;
         let bias_correction1 = 1.0 - self.beta1.powf(t);
-        let bias_correction2 = 1.0 - self.beta2.powf(t);
+       let bias_correction2 = 1.0 - self.beta2.powf(t);
+        let mut changed = false;
 
         for (i, &g) in gradients.iter().enumerate() {
             self.m[i] = self.beta1 * self.m[i] + (1.0 - self.beta1) * g;
@@ -59,10 +67,12 @@ impl Parameter {
 
             let m_hat = self.m[i] / bias_correction1;
             let v_hat = self.v[i] / bias_correction2;
+            let previous = self.values[i];
             self.values[i] -= self.learning_rate * m_hat / (v_hat.sqrt() + self.epsilon);
+            changed |= self.values[i] != previous;
         }
 
-        Ok(())
+        Ok(changed)
     }
 }
 
