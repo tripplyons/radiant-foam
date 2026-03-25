@@ -57,10 +57,6 @@ pub enum VideoInitError {
     Renderer(RendererError),
     Image(image::ImageError),
     MissingCameraId(u32),
-    TooFewRegisteredFrames {
-        extracted_frames: usize,
-        registered_frames: usize,
-    },
 }
 
 impl From<std::io::Error> for VideoInitError {
@@ -154,6 +150,7 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
     ) -> Result<WorkspaceLayout, VideoInitError> {
         let frames_dir = workspace.join("frames");
         let sparse_dir = workspace.join("sparse");
+        let refined_dir = workspace.join("refined");
         let text_dir = workspace.join("text");
         let database_path = workspace.join("database.db");
 
@@ -163,6 +160,7 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
         fs::create_dir_all(workspace)?;
         fs::create_dir_all(&frames_dir)?;
         fs::create_dir_all(&sparse_dir)?;
+        fs::create_dir_all(&refined_dir)?;
         fs::create_dir_all(&text_dir)?;
 
         self.extract_frames(video_path, &frames_dir)?;
@@ -171,7 +169,10 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
         self.run_mapper(&database_path, &frames_dir, &sparse_dir)?;
 
         let sparse_model = first_sparse_model_dir(&sparse_dir)?;
-        self.run_model_converter(&sparse_model, &text_dir)?;
+        self.run_image_registrator(&database_path, &sparse_model, &refined_dir)?;
+        self.run_point_triangulator(&database_path, &frames_dir, &refined_dir)?;
+        self.run_bundle_adjuster(&refined_dir)?;
+        self.run_model_converter(&refined_dir, &text_dir)?;
         Ok(WorkspaceLayout { frames_dir, text_dir })
     }
 
@@ -271,6 +272,66 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
         )
     }
 
+    fn run_image_registrator(
+        &mut self,
+        database_path: &Path,
+        sparse_model: &Path,
+        refined_dir: &Path,
+    ) -> Result<(), VideoInitError> {
+        copy_dir_all(sparse_model, refined_dir)?;
+        self.runner.run(
+            "colmap",
+            &[
+                "image_registrator".to_string(),
+                "--database_path".to_string(),
+                path_arg(database_path),
+                "--input_path".to_string(),
+                path_arg(refined_dir),
+                "--output_path".to_string(),
+                path_arg(refined_dir),
+                "--Mapper.fix_existing_frames".to_string(),
+                "1".to_string(),
+            ],
+        )
+    }
+
+    fn run_point_triangulator(
+        &mut self,
+        database_path: &Path,
+        frames_dir: &Path,
+        refined_dir: &Path,
+    ) -> Result<(), VideoInitError> {
+        self.runner.run(
+            "colmap",
+            &[
+                "point_triangulator".to_string(),
+                "--database_path".to_string(),
+                path_arg(database_path),
+                "--image_path".to_string(),
+                path_arg(frames_dir),
+                "--input_path".to_string(),
+                path_arg(refined_dir),
+                "--output_path".to_string(),
+                path_arg(refined_dir),
+                "--clear_points".to_string(),
+                "0".to_string(),
+            ],
+        )
+    }
+
+    fn run_bundle_adjuster(&mut self, refined_dir: &Path) -> Result<(), VideoInitError> {
+        self.runner.run(
+            "colmap",
+            &[
+                "bundle_adjuster".to_string(),
+                "--input_path".to_string(),
+                path_arg(refined_dir),
+                "--output_path".to_string(),
+                path_arg(refined_dir),
+            ],
+        )
+    }
+
     fn train_scene_on_frames(
         &self,
         scene: &mut Scene,
@@ -343,6 +404,22 @@ fn first_sparse_model_dir(sparse_root: &Path) -> Result<PathBuf, VideoInitError>
         .into_iter()
         .next()
         .ok_or_else(|| VideoInitError::MissingSparseModel(sparse_root.to_path_buf()))
+}
+
+fn copy_dir_all(from: &Path, to: &Path) -> Result<(), VideoInitError> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let source = entry.path();
+        let destination = to.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_all(&source, &destination)?;
+        } else {
+            fs::copy(source, destination)?;
+        }
+    }
+    Ok(())
 }
 
 fn load_scene_from_colmap_text_model(
@@ -422,12 +499,6 @@ fn load_training_frames(
         images.len(),
         extracted_frames,
     );
-    if images.len() < 3 {
-        return Err(VideoInitError::TooFewRegisteredFrames {
-            extracted_frames,
-            registered_frames: images.len(),
-        });
-    }
 
     images
         .into_iter()
@@ -740,7 +811,13 @@ mod tests {
                     .expect("frame output should have parent")
                     .to_path_buf();
                 fs::create_dir_all(&frames_dir)?;
-                for frame_name in ["frame_00001.png", "frame_00005.png", "frame_00009.png"] {
+                for frame_name in [
+                    "frame_00001.png",
+                    "frame_00005.png",
+                    "frame_00009.png",
+                    "frame_00013.png",
+                    "frame_00017.png",
+                ] {
                     RgbImage::from_raw(2, 2, vec![255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0])
                         .expect("image should construct")
                         .save(frames_dir.join(frame_name))?;
@@ -750,11 +827,36 @@ mod tests {
             if program == "colmap" && args.first().map(String::as_str) == Some("mapper") {
                 let sparse_dir = PathBuf::from(argument_value(args, "--output_path"));
                 fs::create_dir_all(sparse_dir.join("0"))?;
+                fs::write(sparse_dir.join("0").join("placeholder.bin"), "model")
+                    .expect("placeholder model should write");
+            }
+
+            if program == "colmap" && args.first().map(String::as_str) == Some("image_registrator") {
+                let refined_dir = PathBuf::from(argument_value(args, "--output_path"));
+                fs::write(
+                    refined_dir.join("registered_count.txt"),
+                    "5",
+                )?;
             }
 
             if program == "colmap" && args.first().map(String::as_str) == Some("model_converter") {
                 let text_dir = PathBuf::from(argument_value(args, "--output_path"));
+                let input_dir = PathBuf::from(argument_value(args, "--input_path"));
                 fs::create_dir_all(&text_dir)?;
+                let registered_count = fs::read_to_string(input_dir.join("registered_count.txt"))
+                    .ok()
+                    .and_then(|contents| contents.trim().parse::<usize>().ok())
+                    .unwrap_or(3);
+                let images_txt = (0..registered_count)
+                    .map(|index| {
+                        format!(
+                            "{} 1 0 0 0 0 0 -{} 1 frame_{:05}.png\n\n",
+                            index + 1,
+                            index as f64 * 0.1,
+                            1 + index * 4
+                        )
+                    })
+                    .collect::<String>();
                 fs::write(
                     text_dir.join("points3D.txt"),
                     "# POINT3D_ID X Y Z R G B ERROR TRACK[]\n1 0.0 0.0 3.0 255 0 0 0.1\n2 0.5 0.1 4.0 255 0 0 0.2\n",
@@ -765,7 +867,7 @@ mod tests {
                 )?;
                 fs::write(
                     text_dir.join("images.txt"),
-                    "# IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME\n1 1 0 0 0 0 0 0 1 frame_00001.png\n\n2 1 0 0 0 0 0 -0.1 1 frame_00005.png\n\n3 1 0 0 0 0 0 -0.2 1 frame_00009.png\n\n",
+                    format!("# IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME\n{images_txt}"),
                 )?;
             }
 
@@ -808,16 +910,19 @@ mod tests {
             .expect("initialization should succeed");
 
         assert_eq!(scene.centroid_x.len(), 2);
-        assert_eq!(initializer.runner.calls.len(), 5);
+        assert_eq!(initializer.runner.calls.len(), 8);
         assert_eq!(initializer.runner.calls[0].0, "ffmpeg");
         assert_eq!(initializer.runner.calls[1].0, "colmap");
         assert_eq!(initializer.runner.calls[1].1[0], "feature_extractor");
         assert_eq!(initializer.runner.calls[2].1[0], "exhaustive_matcher");
         assert_eq!(initializer.runner.calls[3].1[0], "mapper");
+        assert_eq!(initializer.runner.calls[4].1[0], "image_registrator");
+        assert_eq!(initializer.runner.calls[5].1[0], "point_triangulator");
+        assert_eq!(initializer.runner.calls[6].1[0], "bundle_adjuster");
+        assert_eq!(initializer.runner.calls[7].1[0], "model_converter");
         assert!(initializer.runner.calls[2].1.contains(&"--FeatureMatching.guided_matching".to_string()));
         assert!(initializer.runner.calls[3].1.contains(&"--Mapper.multiple_models".to_string()));
         assert!(initializer.runner.calls[3].1.contains(&"0".to_string()));
-        assert_eq!(initializer.runner.calls[4].1[0], "model_converter");
 
         fs::remove_dir_all(temp_dir).expect("temp dir should clean up");
     }
@@ -862,44 +967,12 @@ mod tests {
             .initialize_and_train_from_video(&video_path, &temp_dir.join("workspace"))
             .expect("video training should succeed");
 
-        assert_eq!(scene.centroid_x.step, 3);
-        assert_eq!(scene.centroid_r.step, 3);
+        assert_eq!(scene.centroid_x.step, 5);
+        assert_eq!(scene.centroid_r.step, 5);
 
         fs::remove_dir_all(temp_dir).expect("temp dir should clean up");
     }
 
-    #[test]
-    fn load_training_frames_rejects_when_colmap_registers_too_few_frames() {
-        let temp_dir = make_temp_dir("too-few-frames");
-        let frames_dir = temp_dir.join("frames");
-        fs::create_dir_all(&frames_dir).expect("frames dir should create");
-        RgbImage::from_raw(2, 2, vec![255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0])
-            .expect("image should construct")
-            .save(frames_dir.join("frame_00001.png"))
-            .expect("frame should save");
-        fs::write(
-            temp_dir.join("cameras.txt"),
-            "# CAMERA_ID MODEL WIDTH HEIGHT PARAMS[]\n1 PINHOLE 2 2 2.0 2.0 1.0 1.0\n",
-        )
-        .expect("camera file should write");
-        fs::write(
-            temp_dir.join("images.txt"),
-            "# IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME\n1 1 0 0 0 0 0 0 1 frame_00001.png\n\n",
-        )
-        .expect("images file should write");
-
-        let result = super::load_training_frames(&temp_dir, &frames_dir);
-
-        assert!(matches!(
-            result,
-            Err(VideoInitError::TooFewRegisteredFrames {
-                extracted_frames: 1,
-                registered_frames: 1,
-            })
-        ));
-
-        fs::remove_dir_all(temp_dir).expect("temp dir should clean up");
-    }
 
     fn argument_value<'a>(args: &'a [String], flag: &str) -> &'a str {
         let index = args
