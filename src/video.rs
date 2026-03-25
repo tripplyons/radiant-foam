@@ -210,6 +210,12 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
                 path_arg(frames_dir),
                 "--ImageReader.single_camera".to_string(),
                 "1".to_string(),
+                "--SiftExtraction.max_num_features".to_string(),
+                "16384".to_string(),
+                "--SiftExtraction.estimate_affine_shape".to_string(),
+                "1".to_string(),
+                "--SiftExtraction.domain_size_pooling".to_string(),
+                "1".to_string(),
             ],
         )
     }
@@ -223,6 +229,21 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
                 path_arg(database_path),
                 "--FeatureMatching.guided_matching".to_string(),
                 "1".to_string(),
+                "--FeatureMatching.max_num_matches".to_string(),
+                "65536".to_string(),
+            ],
+        )?;
+
+        self.runner.run(
+            "colmap",
+            &[
+                "transitive_matcher".to_string(),
+                "--database_path".to_string(),
+                path_arg(database_path),
+                "--FeatureMatching.guided_matching".to_string(),
+                "1".to_string(),
+                "--TransitiveMatching.num_iterations".to_string(),
+                "5".to_string(),
             ],
         )
     }
@@ -291,6 +312,16 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
                 path_arg(refined_dir),
                 "--Mapper.fix_existing_frames".to_string(),
                 "1".to_string(),
+                "--Mapper.min_num_matches".to_string(),
+                "8".to_string(),
+                "--Mapper.abs_pose_min_num_inliers".to_string(),
+                "12".to_string(),
+                "--Mapper.abs_pose_min_inlier_ratio".to_string(),
+                "0.05".to_string(),
+                "--Mapper.abs_pose_max_error".to_string(),
+                "20".to_string(),
+                "--Mapper.max_reg_trials".to_string(),
+                "10".to_string(),
             ],
         )
     }
@@ -910,19 +941,21 @@ mod tests {
             .expect("initialization should succeed");
 
         assert_eq!(scene.centroid_x.len(), 2);
-        assert_eq!(initializer.runner.calls.len(), 8);
+        assert_eq!(initializer.runner.calls.len(), 9);
         assert_eq!(initializer.runner.calls[0].0, "ffmpeg");
         assert_eq!(initializer.runner.calls[1].0, "colmap");
         assert_eq!(initializer.runner.calls[1].1[0], "feature_extractor");
         assert_eq!(initializer.runner.calls[2].1[0], "exhaustive_matcher");
-        assert_eq!(initializer.runner.calls[3].1[0], "mapper");
-        assert_eq!(initializer.runner.calls[4].1[0], "image_registrator");
-        assert_eq!(initializer.runner.calls[5].1[0], "point_triangulator");
-        assert_eq!(initializer.runner.calls[6].1[0], "bundle_adjuster");
-        assert_eq!(initializer.runner.calls[7].1[0], "model_converter");
+        assert_eq!(initializer.runner.calls[3].1[0], "transitive_matcher");
+        assert_eq!(initializer.runner.calls[4].1[0], "mapper");
+        assert_eq!(initializer.runner.calls[5].1[0], "image_registrator");
+        assert_eq!(initializer.runner.calls[6].1[0], "point_triangulator");
+        assert_eq!(initializer.runner.calls[7].1[0], "bundle_adjuster");
+        assert_eq!(initializer.runner.calls[8].1[0], "model_converter");
         assert!(initializer.runner.calls[2].1.contains(&"--FeatureMatching.guided_matching".to_string()));
-        assert!(initializer.runner.calls[3].1.contains(&"--Mapper.multiple_models".to_string()));
-        assert!(initializer.runner.calls[3].1.contains(&"0".to_string()));
+        assert!(initializer.runner.calls[3].1.contains(&"--TransitiveMatching.num_iterations".to_string()));
+        assert!(initializer.runner.calls[4].1.contains(&"--Mapper.multiple_models".to_string()));
+        assert!(initializer.runner.calls[4].1.contains(&"0".to_string()));
 
         fs::remove_dir_all(temp_dir).expect("temp dir should clean up");
     }
