@@ -1,5 +1,6 @@
 use crate::parameter::{Parameter, ParameterError};
 use rand::RngExt;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::f64::consts::TAU;
@@ -105,14 +106,25 @@ impl Scene {
     pub fn compute_neighbors(&mut self) -> Result<(), SceneError> {
         self.validate_lengths()?;
         let count = self.centroid_x.len();
-        let mut neighbors = vec![Vec::new(); count];
-
-        for i in 0..count {
-            for j in (i + 1)..count {
-                if self.are_neighbors(i, j) {
-                    neighbors[i].push(j);
-                    neighbors[j].push(i);
+        let points = self.points();
+        let forward_neighbors = (0..count)
+            .into_par_iter()
+            .map(|i| {
+                let mut row = Vec::new();
+                for j in (i + 1)..count {
+                    if are_neighbors_for_points(&points, i, j) {
+                        row.push(j);
+                    }
                 }
+                row
+            })
+            .collect::<Vec<_>>();
+
+        let mut neighbors = vec![Vec::new(); count];
+        for (i, row) in forward_neighbors.into_iter().enumerate() {
+            for j in row {
+                neighbors[i].push(j);
+                neighbors[j].push(i);
             }
         }
 
@@ -173,15 +185,16 @@ impl Scene {
 
         let new_index = count;
         self.centroid_neighbors.push(Vec::new());
+        let points = self.points();
 
-        let is_neighbor = self.are_neighbors(index, new_index);
+        let is_neighbor = are_neighbors_for_points(&points, index, new_index);
         self.set_neighbor_pair(index, new_index, is_neighbor);
 
         for neighbor in old_neighbors {
-            let original_pair = self.are_neighbors(index, neighbor);
+            let original_pair = are_neighbors_for_points(&points, index, neighbor);
             self.set_neighbor_pair(index, neighbor, original_pair);
 
-            let new_pair = self.are_neighbors(new_index, neighbor);
+            let new_pair = are_neighbors_for_points(&points, new_index, neighbor);
             self.set_neighbor_pair(new_index, neighbor, new_pair);
         }
 
@@ -281,62 +294,86 @@ impl Scene {
     }
 
     fn are_neighbors(&self, i: usize, j: usize) -> bool {
-        let pi = self.point(i);
-        let pj = self.point(j);
-        let d = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
-        let d_norm_sq = dot(d, d);
-        if d_norm_sq == 0.0 {
+        let points = self.points();
+        are_neighbors_for_points(&points, i, j)
+    }
+
+    fn points(&self) -> Vec<[f64; 3]> {
+        (0..self.centroid_x.len())
+            .map(|idx| {
+                [
+                    self.centroid_x.values[idx],
+                    self.centroid_y.values[idx],
+                    self.centroid_z.values[idx],
+                ]
+            })
+            .collect()
+    }
+}
+
+fn are_neighbors_for_points(points: &[[f64; 3]], i: usize, j: usize) -> bool {
+    let pi = points[i];
+    let pj = points[j];
+    let d = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
+    let d_norm_sq = dot(d, d);
+    if d_norm_sq == 0.0 {
+        return false;
+    }
+
+    let midpoint = [
+        (pi[0] + pj[0]) * 0.5,
+        (pi[1] + pj[1]) * 0.5,
+        (pi[2] + pj[2]) * 0.5,
+    ];
+    let (basis0, basis1) = bisector_basis(d);
+    let base_radius = d_norm_sq.sqrt() * 0.5;
+    let radii = [0.0, 0.5, 1.0, 2.0, 4.0].map(|s| s * base_radius);
+    let angles = unit_circle_samples();
+
+    for &radius in &radii {
+        for [cos_theta, sin_theta] in angles {
+            let offset = [
+                radius * (cos_theta * basis0[0] + sin_theta * basis1[0]),
+                radius * (cos_theta * basis0[1] + sin_theta * basis1[1]),
+                radius * (cos_theta * basis0[2] + sin_theta * basis1[2]),
+            ];
+            let q = [
+                midpoint[0] + offset[0],
+                midpoint[1] + offset[1],
+                midpoint[2] + offset[2],
+            ];
+            if is_shared_closest_point_for_points(points, q, i, j) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn is_shared_closest_point_for_points(points: &[[f64; 3]], q: [f64; 3], i: usize, j: usize) -> bool {
+    let dij = dist_sq(q, points[i]);
+    let eps = 1e-5 * (1.0 + dij.abs());
+
+    for (k, &point) in points.iter().enumerate() {
+        if k == i || k == j {
+            continue;
+        }
+        let dk = dist_sq(q, point);
+        if dk < dij - eps {
             return false;
         }
-
-        let midpoint = [
-            (pi[0] + pj[0]) * 0.5,
-            (pi[1] + pj[1]) * 0.5,
-            (pi[2] + pj[2]) * 0.5,
-        ];
-        let basis = bisector_basis(d);
-        let base_radius = d_norm_sq.sqrt() * 0.5;
-        let radii = [0.0, 0.5, 1.0, 2.0, 4.0].map(|s| s * base_radius);
-        let steps = 24_usize;
-
-        for &radius in &radii {
-            for t in 0..steps {
-                let angle = TAU * (t as f64 / steps as f64);
-                let offset = [
-                    radius * (angle.cos() * basis.0[0] + angle.sin() * basis.1[0]),
-                    radius * (angle.cos() * basis.0[1] + angle.sin() * basis.1[1]),
-                    radius * (angle.cos() * basis.0[2] + angle.sin() * basis.1[2]),
-                ];
-                let q = [
-                    midpoint[0] + offset[0],
-                    midpoint[1] + offset[1],
-                    midpoint[2] + offset[2],
-                ];
-                if self.is_shared_closest_point(q, i, j) {
-                    return true;
-                }
-            }
-        }
-
-        false
     }
+    true
+}
 
-    fn is_shared_closest_point(&self, q: [f64; 3], i: usize, j: usize) -> bool {
-        let dij = dist_sq(q, self.point(i));
-        let eps = 1e-5 * (1.0 + dij.abs());
-
-        for k in 0..self.centroid_x.len() {
-            if k == i || k == j {
-                continue;
-            }
-            let dk = dist_sq(q, self.point(k));
-            if dk < dij - eps {
-                return false;
-            }
-        }
-        true
-    }
-
+fn unit_circle_samples() -> [[f64; 2]; 24] {
+    std::array::from_fn(|index| {
+        let angle = TAU * (index as f64 / 24.0);
+        [angle.cos(), angle.sin()]
+    })
+}
+impl Scene {
     fn point(&self, idx: usize) -> [f64; 3] {
         [
             self.centroid_x.values[idx],
