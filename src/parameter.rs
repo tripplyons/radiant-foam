@@ -3,7 +3,7 @@ pub enum ParameterError {
     GradientLengthMismatch { expected: usize, got: usize },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Parameter {
     pub values: Vec<f64>,
     pub m: Vec<f64>,

@@ -7,7 +7,7 @@ const SPLIT_SAMPLING_ATTEMPTS: usize = 64;
 const RAY_ADVANCE_EPSILON: f64 = 1e-9;
 const TRANSMITTANCE_EPSILON: f64 = 1e-6;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Scene {
     pub centroid_x: Parameter,
     pub centroid_y: Parameter,
