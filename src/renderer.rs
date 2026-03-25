@@ -61,6 +61,41 @@ impl SceneGradients {
     }
 }
 
+impl SceneGradients {
+    fn add_assign(&mut self, other: &Self) {
+        add_vec_in_place(&mut self.centroid_x, &other.centroid_x);
+        add_vec_in_place(&mut self.centroid_y, &other.centroid_y);
+        add_vec_in_place(&mut self.centroid_z, &other.centroid_z);
+        add_vec_in_place(&mut self.centroid_opacity, &other.centroid_opacity);
+        add_vec_in_place(&mut self.centroid_r, &other.centroid_r);
+        add_vec_in_place(&mut self.centroid_g, &other.centroid_g);
+        add_vec_in_place(&mut self.centroid_b, &other.centroid_b);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TrainingAccumulator {
+    rgb_loss: f64,
+    distortion_loss: f64,
+    gradients: SceneGradients,
+}
+
+impl TrainingAccumulator {
+    fn zeros(count: usize) -> Self {
+        Self {
+            rgb_loss: 0.0,
+            distortion_loss: 0.0,
+            gradients: SceneGradients::zeros(count),
+        }
+    }
+
+    fn add_assign(&mut self, other: &Self) {
+        self.rgb_loss += other.rgb_loss;
+        self.distortion_loss += other.distortion_loss;
+        self.gradients.add_assign(&other.gradients);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TrainStepResult {
     pub loss: f64,
@@ -162,6 +197,11 @@ impl OrthographicRenderer {
     }
 
     fn render_linear(&self, scene: &Scene) -> Result<Vec<f64>, RendererError> {
+        validate_scene(scene)?;
+        let direction = normalize(self.ray_direction);
+        if direction == [0.0, 0.0, 0.0] {
+            return Err(SceneError::InvalidRayDirection.into());
+        }
         let mut pixels = vec![0.0_f64; (self.width as usize) * (self.height as usize) * 3];
         let row_stride = (self.width as usize) * 3;
 
@@ -170,7 +210,7 @@ impl OrthographicRenderer {
                 let py = py as u32;
                 for px in 0..self.width {
                     let start = self.pixel_to_world(px, py);
-                    let color = scene.render(start, self.ray_direction)?;
+                    let color = trace_ray_validated(scene, start, direction).0;
 
                     let idx = (px as usize) * 3;
                     row[idx] = color[0];
@@ -220,51 +260,60 @@ impl OrthographicRenderer {
             return Err(SceneError::InvalidRayDirection.into());
         }
 
-        let mut gradients = SceneGradients::zeros(count);
         let normalizer = 2.0 / ((self.width as usize * self.height as usize * 3) as f64);
         let distortion_normalizer =
             self.distortion_lambda / (self.width as usize * self.height as usize) as f64;
         let target_scale = 1.0 / 255.0;
-        let mut rgb_loss = 0.0_f64;
-        let mut distortion_loss = 0.0_f64;
+        let accumulator = (0..self.height as usize)
+            .into_par_iter()
+            .map(|py| {
+                let py = py as u32;
+                let mut accumulator = TrainingAccumulator::zeros(count);
+                for px in 0..self.width {
+                    let start = self.pixel_to_world(px, py);
+                    let (pixel_color, segments) = trace_ray_validated(scene, start, direction);
+                    let pixel_index = ((py * self.width + px) as usize) * 3;
+                    let target_rgb = [
+                        target.pixels[pixel_index] as f64 * target_scale,
+                        target.pixels[pixel_index + 1] as f64 * target_scale,
+                        target.pixels[pixel_index + 2] as f64 * target_scale,
+                    ];
+                    let output_grad = [
+                        normalizer * (pixel_color[0] - target_rgb[0]),
+                        normalizer * (pixel_color[1] - target_rgb[1]),
+                        normalizer * (pixel_color[2] - target_rgb[2]),
+                    ];
 
-        for py in 0..self.height {
-            for px in 0..self.width {
-                let start = self.pixel_to_world(px, py);
-                let (pixel_color, segments) = trace_ray(scene, start, direction)?;
-                let pixel_index = ((py * self.width + px) as usize) * 3;
-                let target_rgb = [
-                    target.pixels[pixel_index] as f64 * target_scale,
-                    target.pixels[pixel_index + 1] as f64 * target_scale,
-                    target.pixels[pixel_index + 2] as f64 * target_scale,
-                ];
-                let output_grad = [
-                    normalizer * (pixel_color[0] - target_rgb[0]),
-                    normalizer * (pixel_color[1] - target_rgb[1]),
-                    normalizer * (pixel_color[2] - target_rgb[2]),
-                ];
+                    accumulator.rgb_loss += squared_distance(pixel_color, target_rgb);
+                    accumulator.distortion_loss += accumulate_trace_gradients(
+                        scene,
+                        &segments,
+                        start,
+                        direction,
+                        output_grad,
+                        distortion_normalizer,
+                        &mut accumulator.gradients,
+                    );
+                }
+                accumulator
+            })
+            .reduce(
+                || TrainingAccumulator::zeros(count),
+                |mut left, right| {
+                    left.add_assign(&right);
+                    left
+                },
+            );
 
-                rgb_loss += squared_distance(pixel_color, target_rgb);
-                distortion_loss += accumulate_trace_gradients(
-                    scene,
-                    &segments,
-                    start,
-                    direction,
-                    output_grad,
-                    distortion_normalizer,
-                    &mut gradients,
-                );
-            }
-        }
-
-        rgb_loss /= (self.width as usize * self.height as usize * 3) as f64;
-        distortion_loss /= (self.width as usize * self.height as usize) as f64;
+        let rgb_loss = accumulator.rgb_loss / (self.width as usize * self.height as usize * 3) as f64;
+        let distortion_loss =
+            accumulator.distortion_loss / (self.width as usize * self.height as usize) as f64;
 
         Ok(TrainStepResult {
             loss: rgb_loss + self.distortion_lambda * distortion_loss,
             rgb_loss,
             distortion_loss,
-            gradients,
+            gradients: accumulator.gradients,
         })
     }
 }
@@ -295,6 +344,7 @@ impl PerspectiveRenderer {
     }
 
     fn render_linear(&self, scene: &Scene) -> Result<Vec<f64>, RendererError> {
+        validate_scene(scene)?;
         let mut pixels =
             vec![0.0_f64; (self.camera.width as usize) * (self.camera.height as usize) * 3];
         let row_stride = (self.camera.width as usize) * 3;
@@ -304,7 +354,7 @@ impl PerspectiveRenderer {
                 let py = py as u32;
                 for px in 0..self.camera.width {
                     let (start, direction) = self.camera.pixel_to_world_ray(px, py);
-                    let color = trace_ray(scene, start, direction)?.0;
+                    let color = trace_ray_validated(scene, start, direction).0;
 
                     let idx = (px as usize) * 3;
                     row[idx] = color[0];
@@ -334,52 +384,62 @@ impl PerspectiveRenderer {
         self.validate_target(target)?;
         let count = validate_scene(scene)?;
 
-        let mut gradients = SceneGradients::zeros(count);
         let normalizer =
             2.0 / ((self.camera.width as usize * self.camera.height as usize * 3) as f64);
         let distortion_normalizer =
             self.distortion_lambda / (self.camera.width as usize * self.camera.height as usize) as f64;
         let target_scale = 1.0 / 255.0;
-        let mut rgb_loss = 0.0_f64;
-        let mut distortion_loss = 0.0_f64;
+        let accumulator = (0..self.camera.height as usize)
+            .into_par_iter()
+            .map(|py| {
+                let py = py as u32;
+                let mut accumulator = TrainingAccumulator::zeros(count);
+                for px in 0..self.camera.width {
+                    let (start, direction) = self.camera.pixel_to_world_ray(px, py);
+                    let (pixel_color, segments) = trace_ray_validated(scene, start, direction);
+                    let pixel_index = ((py * self.camera.width + px) as usize) * 3;
+                    let target_rgb = [
+                        target.pixels[pixel_index] as f64 * target_scale,
+                        target.pixels[pixel_index + 1] as f64 * target_scale,
+                        target.pixels[pixel_index + 2] as f64 * target_scale,
+                    ];
+                    let output_grad = [
+                        normalizer * (pixel_color[0] - target_rgb[0]),
+                        normalizer * (pixel_color[1] - target_rgb[1]),
+                        normalizer * (pixel_color[2] - target_rgb[2]),
+                    ];
 
-        for py in 0..self.camera.height {
-            for px in 0..self.camera.width {
-                let (start, direction) = self.camera.pixel_to_world_ray(px, py);
-                let (pixel_color, segments) = trace_ray(scene, start, direction)?;
-                let pixel_index = ((py * self.camera.width + px) as usize) * 3;
-                let target_rgb = [
-                    target.pixels[pixel_index] as f64 * target_scale,
-                    target.pixels[pixel_index + 1] as f64 * target_scale,
-                    target.pixels[pixel_index + 2] as f64 * target_scale,
-                ];
-                let output_grad = [
-                    normalizer * (pixel_color[0] - target_rgb[0]),
-                    normalizer * (pixel_color[1] - target_rgb[1]),
-                    normalizer * (pixel_color[2] - target_rgb[2]),
-                ];
+                    accumulator.rgb_loss += squared_distance(pixel_color, target_rgb);
+                    accumulator.distortion_loss += accumulate_trace_gradients(
+                        scene,
+                        &segments,
+                        start,
+                        direction,
+                        output_grad,
+                        distortion_normalizer,
+                        &mut accumulator.gradients,
+                    );
+                }
+                accumulator
+            })
+            .reduce(
+                || TrainingAccumulator::zeros(count),
+                |mut left, right| {
+                    left.add_assign(&right);
+                    left
+                },
+            );
 
-                rgb_loss += squared_distance(pixel_color, target_rgb);
-                distortion_loss += accumulate_trace_gradients(
-                    scene,
-                    &segments,
-                    start,
-                    direction,
-                    output_grad,
-                    distortion_normalizer,
-                    &mut gradients,
-                );
-            }
-        }
-
-        rgb_loss /= (self.camera.width as usize * self.camera.height as usize * 3) as f64;
-        distortion_loss /= (self.camera.width as usize * self.camera.height as usize) as f64;
+        let rgb_loss =
+            accumulator.rgb_loss / (self.camera.width as usize * self.camera.height as usize * 3) as f64;
+        let distortion_loss =
+            accumulator.distortion_loss / (self.camera.width as usize * self.camera.height as usize) as f64;
 
         Ok(TrainStepResult {
             loss: rgb_loss + self.distortion_lambda * distortion_loss,
             rgb_loss,
             distortion_loss,
-            gradients,
+            gradients: accumulator.gradients,
         })
     }
 }
@@ -481,6 +541,12 @@ fn validate_target_dimensions(
     }
 }
 
+fn add_vec_in_place(target: &mut [f64], source: &[f64]) {
+    for (dst, src) in target.iter_mut().zip(source) {
+        *dst += src;
+    }
+}
+
 fn squared_distance(a: [f64; 3], b: [f64; 3]) -> f64 {
     let dx = a[0] - b[0];
     let dy = a[1] - b[1];
@@ -578,13 +644,11 @@ fn validate_scene(scene: &Scene) -> Result<usize, SceneError> {
     Ok(x)
 }
 
-fn trace_ray(
+fn trace_ray_validated(
     scene: &Scene,
     ray_origin: [f64; 3],
     direction: [f64; 3],
-) -> Result<([f64; 3], Vec<RaySegment>), RendererError> {
-    validate_scene(scene)?;
-
+) -> ([f64; 3], Vec<RaySegment>) {
     let mut color = [0.0, 0.0, 0.0];
     let mut remaining = 1.0_f64;
     let mut current = closest_centroid_at_point(scene, ray_origin);
@@ -627,7 +691,7 @@ fn trace_ray(
         t0 = t_cross;
     }
 
-    Ok((color, segments))
+    (color, segments)
 }
 
 fn accumulate_trace_gradients(
