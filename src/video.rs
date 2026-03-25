@@ -260,14 +260,43 @@ impl<R: CommandRunner> ColmapVideoInitializer<R> {
         scene: &mut Scene,
         frames: &[TrainingFrame],
     ) -> Result<(), VideoInitError> {
-        for _ in 0..self.options.train_epochs {
-            for frame in frames {
+        for epoch_index in 0..self.options.train_epochs {
+            let mut epoch_total_loss = 0.0_f64;
+            let mut epoch_rgb_loss = 0.0_f64;
+            let mut epoch_distortion_loss = 0.0_f64;
+
+            for (frame_index, frame) in frames.iter().enumerate() {
                 let renderer = PerspectiveRenderer::with_distortion(
                     frame.camera.clone(),
                     self.options.distortion_lambda,
                 );
-                renderer.train_step(scene, &frame.target)?;
+                let result = renderer.train_step(scene, &frame.target)?;
+                epoch_total_loss += result.loss;
+                epoch_rgb_loss += result.rgb_loss;
+                epoch_distortion_loss += result.distortion_loss;
+
+                println!(
+                    "epoch {}/{} step {}/{} frame={} loss={:.6} rgb_loss={:.6} distortion_loss={:.6}",
+                    epoch_index + 1,
+                    self.options.train_epochs,
+                    frame_index + 1,
+                    frames.len(),
+                    frame.name,
+                    result.loss,
+                    result.rgb_loss,
+                    result.distortion_loss,
+                );
             }
+
+            let frame_count = frames.len() as f64;
+            println!(
+                "epoch {}/{} avg_loss={:.6} avg_rgb_loss={:.6} avg_distortion_loss={:.6}",
+                epoch_index + 1,
+                self.options.train_epochs,
+                epoch_total_loss / frame_count,
+                epoch_rgb_loss / frame_count,
+                epoch_distortion_loss / frame_count,
+            );
         }
         Ok(())
     }
@@ -375,6 +404,7 @@ fn load_training_frames(
             let image_path = frames_dir.join(&image.name);
             let target = load_target_image(&image_path)?;
             Ok(TrainingFrame {
+                name: image.name,
                 camera: camera_model.to_perspective_camera(image.world_to_camera_rotation, image.translation),
                 target,
             })
@@ -431,6 +461,7 @@ struct SparsePoint {
 
 #[derive(Clone, Debug)]
 struct TrainingFrame {
+    name: String,
     camera: PerspectiveCamera,
     target: ImageData,
 }
