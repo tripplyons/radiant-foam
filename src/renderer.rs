@@ -155,6 +155,92 @@ impl PerspectiveCamera {
     }
 }
 
+#[derive(Clone, Debug)]
+struct OrthographicRenderPlan {
+    direction: [f64; 3],
+    x_positions: Vec<f64>,
+    y_positions: Vec<f64>,
+    ray_start_z: f64,
+}
+
+impl OrthographicRenderPlan {
+    fn build(renderer: &OrthographicRenderer) -> Result<Self, RendererError> {
+        let direction = normalize(renderer.ray_direction);
+        if direction == [0.0, 0.0, 0.0] {
+            return Err(SceneError::InvalidRayDirection.into());
+        }
+
+        Ok(Self {
+            direction,
+            x_positions: sample_positions(renderer.width, renderer.world_x_min, renderer.world_x_max),
+            y_positions: sample_positions_flipped(
+                renderer.height,
+                renderer.world_y_min,
+                renderer.world_y_max,
+            ),
+            ray_start_z: renderer.ray_start_z,
+        })
+    }
+
+    fn start(&self, px: u32, py: u32) -> [f64; 3] {
+        [
+            self.x_positions[px as usize],
+            self.y_positions[py as usize],
+            self.ray_start_z,
+        ]
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PerspectiveRenderPlan {
+    origin: [f64; 3],
+    basis_x: [f64; 3],
+    basis_y: [f64; 3],
+    basis_z: [f64; 3],
+    x_camera: Vec<f64>,
+    y_camera: Vec<f64>,
+}
+
+impl PerspectiveRenderPlan {
+    fn build(camera: &PerspectiveCamera) -> Self {
+        Self {
+            origin: camera.origin,
+            basis_x: [
+                camera.camera_to_world[0][0],
+                camera.camera_to_world[1][0],
+                camera.camera_to_world[2][0],
+            ],
+            basis_y: [
+                camera.camera_to_world[0][1],
+                camera.camera_to_world[1][1],
+                camera.camera_to_world[2][1],
+            ],
+            basis_z: [
+                camera.camera_to_world[0][2],
+                camera.camera_to_world[1][2],
+                camera.camera_to_world[2][2],
+            ],
+            x_camera: (0..camera.width)
+                .map(|px| (px as f64 + 0.5 - camera.principal_x) / camera.focal_x)
+                .collect(),
+            y_camera: (0..camera.height)
+                .map(|py| (py as f64 + 0.5 - camera.principal_y) / camera.focal_y)
+                .collect(),
+        }
+    }
+
+    fn ray(&self, px: u32, py: u32) -> ([f64; 3], [f64; 3]) {
+        let x = self.x_camera[px as usize];
+        let y = self.y_camera[py as usize];
+        let direction = normalize([
+            x * self.basis_x[0] + y * self.basis_y[0] + self.basis_z[0],
+            x * self.basis_x[1] + y * self.basis_y[1] + self.basis_z[1],
+            x * self.basis_x[2] + y * self.basis_y[2] + self.basis_z[2],
+        ]);
+        (self.origin, direction)
+    }
+}
+
 #[derive(Debug)]
 pub struct OrthographicRenderer {
     pub width: u32,
@@ -183,34 +269,13 @@ impl OrthographicRenderer {
         }
     }
 
-    fn pixel_to_world(&self, px: u32, py: u32) -> [f64; 3] {
-        let nx = if self.width > 1 {
-            px as f64 / (self.width - 1) as f64
-        } else {
-            0.5
-        };
-        let ny = if self.height > 1 {
-            py as f64 / (self.height - 1) as f64
-        } else {
-            0.5
-        };
-
-        let x = self.world_x_min + nx * (self.world_x_max - self.world_x_min);
-        // Flip Y so row 0 is top of image.
-        let y = self.world_y_max - ny * (self.world_y_max - self.world_y_min);
-        [x, y, self.ray_start_z]
-    }
-
     fn validate_target(&self, target: &ImageData) -> Result<(), RendererError> {
         validate_target_dimensions(self.width, self.height, target)
     }
 
     fn render_linear(&self, scene: &Scene) -> Result<Vec<f64>, RendererError> {
         validate_scene(scene)?;
-        let direction = normalize(self.ray_direction);
-        if direction == [0.0, 0.0, 0.0] {
-            return Err(SceneError::InvalidRayDirection.into());
-        }
+        let plan = OrthographicRenderPlan::build(self)?;
         let mut pixels = vec![0.0_f64; (self.width as usize) * (self.height as usize) * 3];
         let row_stride = (self.width as usize) * 3;
 
@@ -219,8 +284,8 @@ impl OrthographicRenderer {
                 let py = py as u32;
                 let mut scratch = RayTraceScratch::default();
                 for px in 0..self.width {
-                    let start = self.pixel_to_world(px, py);
-                    let color = trace_ray_validated(scene, start, direction, &mut scratch);
+                    let start = plan.start(px, py);
+                    let color = trace_ray_validated(scene, start, plan.direction, &mut scratch);
 
                     let idx = (px as usize) * 3;
                     row[idx] = color[0];
@@ -265,10 +330,7 @@ impl OrthographicRenderer {
     ) -> Result<TrainStepResult, RendererError> {
         self.validate_target(target)?;
         let count = validate_scene(scene)?;
-        let direction = normalize(self.ray_direction);
-        if direction == [0.0, 0.0, 0.0] {
-            return Err(SceneError::InvalidRayDirection.into());
-        }
+        let plan = OrthographicRenderPlan::build(self)?;
 
         let normalizer = 2.0 / ((self.width as usize * self.height as usize * 3) as f64);
         let distortion_normalizer =
@@ -281,8 +343,9 @@ impl OrthographicRenderer {
                 let mut accumulator = TrainingAccumulator::zeros(count);
                 let mut scratch = RayTraceScratch::default();
                 for px in 0..self.width {
-                    let start = self.pixel_to_world(px, py);
-                    let pixel_color = trace_ray_validated(scene, start, direction, &mut scratch);
+                    let start = plan.start(px, py);
+                    let pixel_color =
+                        trace_ray_validated(scene, start, plan.direction, &mut scratch);
                     let pixel_index = ((py * self.width + px) as usize) * 3;
                     let target_rgb = [
                         target.pixels[pixel_index] as f64 * target_scale,
@@ -299,7 +362,7 @@ impl OrthographicRenderer {
                     accumulator.distortion_loss += accumulate_trace_gradients(
                         scene,
                         start,
-                        direction,
+                        plan.direction,
                         output_grad,
                         distortion_normalizer,
                         &mut scratch,
@@ -356,6 +419,7 @@ impl PerspectiveRenderer {
 
     fn render_linear(&self, scene: &Scene) -> Result<Vec<f64>, RendererError> {
         validate_scene(scene)?;
+        let plan = PerspectiveRenderPlan::build(&self.camera);
         let mut pixels =
             vec![0.0_f64; (self.camera.width as usize) * (self.camera.height as usize) * 3];
         let row_stride = (self.camera.width as usize) * 3;
@@ -365,7 +429,7 @@ impl PerspectiveRenderer {
                 let py = py as u32;
                 let mut scratch = RayTraceScratch::default();
                 for px in 0..self.camera.width {
-                    let (start, direction) = self.camera.pixel_to_world_ray(px, py);
+                    let (start, direction) = plan.ray(px, py);
                     let color = trace_ray_validated(scene, start, direction, &mut scratch);
 
                     let idx = (px as usize) * 3;
@@ -395,6 +459,7 @@ impl PerspectiveRenderer {
     ) -> Result<TrainStepResult, RendererError> {
         self.validate_target(target)?;
         let count = validate_scene(scene)?;
+        let plan = PerspectiveRenderPlan::build(&self.camera);
 
         let normalizer =
             2.0 / ((self.camera.width as usize * self.camera.height as usize * 3) as f64);
@@ -408,7 +473,7 @@ impl PerspectiveRenderer {
                 let mut accumulator = TrainingAccumulator::zeros(count);
                 let mut scratch = RayTraceScratch::default();
                 for px in 0..self.camera.width {
-                    let (start, direction) = self.camera.pixel_to_world_ray(px, py);
+                    let (start, direction) = plan.ray(px, py);
                     let pixel_color = trace_ray_validated(scene, start, direction, &mut scratch);
                     let pixel_index = ((py * self.camera.width + px) as usize) * 3;
                     let target_rgb = [
@@ -558,6 +623,25 @@ fn add_vec_in_place(target: &mut [f64], source: &[f64]) {
     for (dst, src) in target.iter_mut().zip(source) {
         *dst += src;
     }
+}
+
+fn sample_positions(count: u32, min: f64, max: f64) -> Vec<f64> {
+    if count <= 1 {
+        vec![(min + max) * 0.5]
+    } else {
+        (0..count)
+            .map(|index| {
+                let normalized = index as f64 / (count - 1) as f64;
+                min + normalized * (max - min)
+            })
+            .collect()
+    }
+}
+
+fn sample_positions_flipped(count: u32, min: f64, max: f64) -> Vec<f64> {
+    let mut positions = sample_positions(count, min, max);
+    positions.reverse();
+    positions
 }
 
 fn squared_distance(a: [f64; 3], b: [f64; 3]) -> f64 {
